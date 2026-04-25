@@ -1,0 +1,14 @@
+# Build from repository root:
+#   docker build -f backend/deploy/Dockerfile.proctor -t ai-interview-proctor .
+FROM python:3.11-slim-bookworm
+WORKDIR /app
+ENV PYTHONUNBUFFERED=1
+COPY backend/requirements.txt backend/requirements-proctor.txt ./backend/
+RUN pip install --no-cache-dir -r backend/requirements-proctor.txt
+COPY backend/ ./backend/
+WORKDIR /app/backend
+EXPOSE 5051
+ENV PROCTOR_PORT=5051
+ENV GUNICORN_WORKERS=1
+ENV GUNICORN_THREADS=4
+CMD ["sh", "-c", "exec gunicorn -b 0.0.0.0:5051 -k gthread --threads ${GUNICORN_THREADS:-4} --workers ${GUNICORN_WORKERS:-1} run_proctor_server:app"]

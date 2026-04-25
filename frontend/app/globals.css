@@ -1,0 +1,301 @@
+@import "tailwindcss";
+
+:root {
+  --background: #f8faff;                  /* Light: subtle blue-tinted white */
+  --foreground: #0f172a;                  /* Light: deep slate-900 */
+  --card-bg: #ffffff;
+  --card-border: #e2e8f0;                 
+  --nav-bg: rgba(248, 251, 255, 0.85);
+  --border: #e2e8f0;
+  --text-muted: #64748b;                  
+  --accent: #2563eb;                      /* Professional Blue */
+  --accent-secondary: #1d4ed8;            
+  --input-bg: #f1f5f9;                    
+  --success: #10b981;
+  --warning: #f59e0b;
+  --error: #ef4444;
+}
+
+/* ──── DARK THEME (NAVY BLUE) ────────────────────────────── */
+.dark,
+[data-theme="dark"] {
+  --background: #020617;                  /* Deep Navy (slate-950) */
+  --foreground: #f1f5f9;                  
+  --card-bg: #0f172a;                     /* slate-900 */
+  --card-border: #1e293b;                 /* slate-800 */
+  --nav-bg: rgba(2, 6, 23, 0.88);
+  --border: #1e293b;                      
+  --text-muted: #94a3b8;                  
+  --accent: #3b82f6;                      
+  --accent-secondary: #60a5fa;            
+  --input-bg: #0f172a;                    
+  --success: #34d399;
+  --warning: #fbbf24;
+  --error: #f87171;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-accent: var(--accent);
+  --font-sans: var(--font-plus-jakarta);
+  --font-mono: var(--font-geist-mono);
+}
+
+body, input, select, textarea, h1, h2, h3, h4, h5, h6 {
+  color: var(--foreground);
+  font-family: var(--font-inter), sans-serif !important;
+  transition: background-color 0.4s cubic-bezier(0.4, 0, 0.2, 1), color 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+  letter-spacing: -0.015em;
+}
+
+button {
+  font-family: inherit;
+  transition: all 0.3s ease;
+}
+
+body {
+  background-color: var(--background);
+}
+
+@layer utilities {
+  .mobile-px {
+    @apply px-4 md:px-8 lg:px-12;
+  }
+  .glass {
+    @apply backdrop-blur-xl bg-white/80 border border-slate-100 shadow-[0_4px_24px_-4px_rgba(0,0,0,0.04)];
+  }
+  .glass-dark {
+    @apply backdrop-blur-2xl bg-white/60 border border-slate-200 shadow-2xl;
+  }
+  .soft-shadow {
+    @apply shadow-[0_8px_30px_rgb(0,0,0,0.04)];
+  }
+  .button-premium {
+    @apply relative overflow-hidden transition-all duration-300 active:scale-95 hover:shadow-xl hover:shadow-slate-200/50 active:shadow-inner;
+  }
+  .bg-classy-grid {
+    background-image: radial-gradient(#f1f5f9 0.8px, transparent 0.8px);
+    background-size: 24px 24px;
+    opacity: 0.8;
+  }
+  .custom-scrollbar::-webkit-scrollbar {
+    width: 6px;
+  }
+  .custom-scrollbar::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  .custom-scrollbar::-webkit-scrollbar-thumb {
+    @apply bg-slate-900/10 rounded-full transition-colors;
+  }
+  .custom-scrollbar:hover::-webkit-scrollbar-thumb {
+    @apply bg-slate-900/20;
+  }
+}
+
+/* Animations */
+@keyframes mesh-move {
+  0% {
+    background-position: 0% 0%;
+  }
+
+  100% {
+    background-position: 100% 100%;
+  }
+}
+
+.animated-mesh {
+  background-color: var(--background);
+  background-image:
+    radial-gradient(at 0% 0%, rgba(15, 23, 42, 0.05) 0, transparent 50%),
+    radial-gradient(at 100% 100%, rgba(0, 0, 0, 0.05) 0, transparent 50%);
+  background-size: 200% 200%;
+  animation: mesh-move 15s ease infinite alternate;
+}
+
+@keyframes float {
+
+  0%,
+  100% {
+    transform: translateY(0px);
+  }
+
+  50% {
+    transform: translateY(-15px);
+  }
+}
+
+.animate-float {
+  animation: float 4s ease-in-out infinite;
+}
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(20px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.animate-fadeIn {
+  animation: fadeIn 0.8s cubic-bezier(0.4, 0, 0.2, 1) forwards;
+}
+
+@keyframes slideIn {
+  from {
+    opacity: 0;
+    transform: translateX(20px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+.animate-slideIn {
+  animation: slideIn 0.3s ease-out forwards;
+}
+
+@keyframes bounce-slow {
+
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+
+  50% {
+    transform: translateY(-10px);
+  }
+}
+
+.animate-bounce-slow {
+  animation: bounce-slow 3s ease-in-out infinite;
+}
+
+@keyframes shake {
+
+  0%,
+  100% {
+    transform: translateX(0);
+  }
+
+  25% {
+    transform: translateX(-5px);
+  }
+
+  75% {
+    transform: translateX(5px);
+  }
+}
+
+.animate-shake {
+  animation: shake 0.3s ease-in-out;
+}
+
+@keyframes progress {
+  from {
+    width: 0%;
+  }
+
+  to {
+    width: 100%;
+  }
+}
+
+.animate-progress {
+  animation: progress 2.5s linear forwards;
+}
+
+/* Hide default browser eye icons for passwords */
+input::-ms-reveal,
+input::-ms-clear {
+  display: none !important;
+}
+
+input::-webkit-credentials-auto-fill-button {
+  display: none !important;
+}
+
+/* LIP SYNC animation — used by agent speaking overlay */
+@keyframes lipsync {
+  0% {
+    transform: scaleY(0.3);
+    opacity: 0.6;
+  }
+  50% {
+    transform: scaleY(1.2);
+    opacity: 1;
+  }
+  100% {
+    transform: scaleY(0.5);
+    opacity: 0.7;
+  }
+}
+
+/* Speaking glow pulse around agent panel */
+@keyframes speaking-glow {
+  0%, 100% {
+    box-shadow: 0 0 0 0 rgba(15, 23, 42, 0);
+  }
+  50% {
+    box-shadow: 0 0 0 8px rgba(15, 23, 42, 0.15);
+  }
+}
+
+.agent-speaking {
+  animation: speaking-glow 0.8s ease-in-out infinite;
+}
+
+@media print {
+  aside, nav, .no-print, button:not(.print-only) {
+    display: none !important;
+  }
+  .print-container {
+    padding: 0 !important;
+    margin: 0 !important;
+    background: white !important;
+  }
+  .main-content {
+    margin-left: 0 !important;
+    padding: 0 !important;
+  }
+  .preview-card {
+    border: none !important;
+    box-shadow: none !important;
+    width: 100% !important;
+    min-height: auto !important;
+    transform: none !important;
+  }
+}
+
+/* --- PREMIUM DASHBOARD UTILITIES --- */
+.active-tab-scale {
+    transform: scale(1.02);
+    transition: all 0.3s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+.shadow-premium {
+    box-shadow: 0 25px 50px -12px rgba(37, 99, 235, 0.15);
+}
+
+.custom-scrollbar::-webkit-scrollbar {
+  width: 6px;
+}
+
+.custom-scrollbar::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.custom-scrollbar::-webkit-scrollbar-thumb {
+  background: rgba(148, 163, 184, 0.1);
+  border-radius: 10px;
+}
+
+.custom-scrollbar::-webkit-scrollbar-thumb:hover {
+  background: rgba(148, 163, 184, 0.3);
+}

@@ -1,0 +1,71 @@
+
+services:
+  # Database Service (PostgreSQL)
+  db:
+    image: postgres:15-alpine
+    container_name: ai_interviewer_db
+    environment:
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-admin123}
+      POSTGRES_DB: ${DB_NAME:-ai_interviewer}
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: always
+
+  # Database Management Service (PGAdmin)
+  pgadmin:
+    image: dpage/pgadmin4
+    container_name: ai_interviewer_pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@admin.com
+      PGADMIN_DEFAULT_PASSWORD: admin
+    ports:
+      - "8080:80"
+    depends_on:
+      - db
+    restart: always
+
+  # Backend API Service
+  backend:
+    build: ./backend
+    container_name: ai_interviewer_backend
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./backend/storage:/app/storage
+      - ./backend/resumes:/app/resumes
+      - ./backend/logs:/app/logs
+    env_file:
+      - ./backend/.env
+    environment:
+      - DB_HOST=db  # Override localhost with service name for container networking
+      - PYTHONIOENCODING=utf-8
+    depends_on:
+      - db
+    restart: always
+
+  # Frontend Web Service
+  # Browser must reach the host-published backend URL: use localhost (not "backend" hostname) for NEXT_PUBLIC_API_URL.
+  # Override: NEXT_PUBLIC_API_URL=https://api.example.com
+  frontend:
+    build: ./frontend
+    container_name: ai_interviewer_frontend
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:-http://localhost:5000}
+      - INTERNAL_BACKEND_URL=http://backend:5000
+    env_file:
+      - ./frontend/.env
+    depends_on:
+      - backend
+    restart: always
+
+volumes:
+  postgres_data:
+
+networks:
+  default:
+    name: ai_interviewer_network

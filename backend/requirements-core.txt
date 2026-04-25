@@ -1,0 +1,8 @@
+# Part 1 — main API (`api:app` via gunicorn or `python api.py`).
+# Currently includes the full dependency set from requirements.txt because
+# InterviewManager imports OpenCV and charts use matplotlib.
+#
+# Future: trim tensorflow / torch / ultralytics / deepface here once those are
+# lazy-loaded only inside the proctor worker.
+
+-r requirements.txt

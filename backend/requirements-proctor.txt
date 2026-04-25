@@ -1,0 +1,4 @@
+# Part 2 — dedicated proctoring worker (`run_proctor_server:app`).
+# Full computer-vision / ML stack for frame processing and evidence capture.
+
+-r requirements.txt

@@ -1,0 +1,13 @@
+# Build from repository root:
+#   docker build -f backend/deploy/Dockerfile.api -t ai-interview-api .
+FROM python:3.11-slim-bookworm
+WORKDIR /app
+ENV PYTHONUNBUFFERED=1
+COPY backend/requirements.txt backend/requirements-core.txt ./backend/
+RUN pip install --no-cache-dir -r backend/requirements-core.txt
+COPY backend/ ./backend/
+WORKDIR /app/backend
+EXPOSE 5000
+ENV GUNICORN_WORKERS=1
+ENV GUNICORN_THREADS=4
+CMD ["sh", "-c", "exec gunicorn -b 0.0.0.0:5000 -k gthread --threads ${GUNICORN_THREADS:-4} --workers ${GUNICORN_WORKERS:-1} api:app"]
