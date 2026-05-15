@@ -138,27 +138,23 @@ def proctor_status():
 
 @proctor_bp.route("/proctor/reset", methods=["POST"])
 def proctor_reset():
-    _p().initial_nose = None
+    """
+    Reset proctor counters only. Do NOT call manager.reset() here — that was wiping
+    resume/session state and new manager.session_id while the workflow still used the
+    old session, which broke monitoring and interview APIs.
+    """
     _p().prev_gray = None
-    _p().consecutive_no_face = 0
-    _p().consecutive_phone = 0
-    _p().should_terminate = False
-    _p().termination_reason = None
-    _p().violations = []
-    _m().reset()
     _p().session_id = _m().session_id
+    # Full proctor state + lazy models + running=True (same as /proctor/start)
+    _p().start()
     if hasattr(_p(), "consecutive_yolo_people"):
         _p().consecutive_yolo_people = 0
-    if hasattr(_p(), "consecutive_multi_face"):
-        _p().consecutive_multi_face = 0
-    if hasattr(_p(), "consecutive_looking_away"):
-        _p().consecutive_looking_away = 0
-    if hasattr(_p(), "consecutive_identity_mismatch"):
-        _p().consecutive_identity_mismatch = 0
+    if hasattr(_p(), "_identity_check_count"):
+        _p()._identity_check_count = 0
     return jsonify(
         {
             "status": "success",
-            "message": "Proctoring and Interview state reset/re-calibrated",
+            "message": "Proctoring counters reset and monitoring (re)started",
         }
     )
 
@@ -176,8 +172,25 @@ def proctor_event():
     event_type = data.get("type", "general")
     message = data.get("message", "UI Event detected")
     severity = data.get("severity", "MEDIUM")
+    image_data = data.get("image")
 
-    _p().record_event(event_type, message, severity)
+    frame = None
+    if image_data:
+        try:
+            import base64
+            import numpy as np
+            import cv2
+
+            if "," in image_data:
+                image_data = image_data.split(",")[1]
+            img_bytes = base64.b64decode(image_data)
+            nparr = np.frombuffer(img_bytes, np.uint8)
+            frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        except Exception as e:
+            print(f"proctor_event: could not decode evidence image: {e}")
+            frame = None
+
+    _p().record_event(event_type, message, severity, frame=frame)
     _merge()
     return jsonify({"status": "success"})
 
@@ -233,15 +246,16 @@ def process_frame():
 
         _merge()
 
-        return jsonify(
-            {
-                "status": "success",
-                "face_detected": result.get("face_detected", False) if result else False,
-                "warning": result.get("current_warning", None) if result else None,
-                "should_terminate": _p().should_terminate,
-                "termination_reason": _p().termination_reason,
-            }
-        )
+        payload = {
+            "status": "success",
+            "face_detected": result.get("face_detected", False) if result else False,
+            "warning": result.get("current_warning", None) if result else None,
+            "should_terminate": _p().should_terminate,
+            "termination_reason": _p().termination_reason,
+        }
+        if result and "identity_match" in result:
+            payload["identity_match"] = result["identity_match"]
+        return jsonify(payload)
     except Exception as e:
         print(f"Frame Process Error: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500

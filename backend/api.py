@@ -441,19 +441,23 @@ def admin_signup():
 
 @app.route('/api/auth/login', methods=['POST'])
 def login():
-    data = request.json
-    identifier = data.get('identifier') # Email or Phone
-    password = data.get('password')
-    
-    print(f"🔑 [LOGIN ATTEMPT] Identifier: {identifier}")
-    
-    user = database.authenticate_user(identifier, password)
-    if user:
-        print(f"✅ [LOGIN SUCCESS] User: {user['email']}")
-        return jsonify({"status": "success", "user": user})
-    
-    print(f"❌ [LOGIN FAILED] Invalid credentials for: {identifier}")
-    return jsonify({"status": "error", "message": "Invalid credentials"}), 401
+    try:
+        data = request.json or {}
+        identifier = data.get('identifier')  # Email or Phone
+        password = data.get('password')
+
+        log.info("[LOGIN ATTEMPT] Identifier=%s", (identifier or "")[:64])
+
+        user = database.authenticate_user(identifier, password)
+        if user:
+            log.info("[LOGIN SUCCESS] User id=%s email=%s", user.get("id"), user.get("email"))
+            return jsonify({"status": "success", "user": user})
+
+        log.info("[LOGIN FAILED] Invalid credentials")
+        return jsonify({"status": "error", "message": "Invalid credentials"}), 401
+    except Exception as e:
+        log.exception("login")
+        return jsonify({"status": "error", "message": "Login temporarily unavailable. Please try again."}), 500
 
 # RAZORPAY CONFIG (no placeholder defaults — use real keys + PAYMENT_TEST_MODE=false in production)
 RAZORPAY_KEY_ID = (os.environ.get("RAZORPAY_KEY_ID") or "").strip()
@@ -640,7 +644,7 @@ def admin_login():
 
 @app.route('/api/admin/verify_otp', methods=['POST'])
 def verify_admin_otp():
-    data = request.json
+    data = request.get_json(silent=True) or {}
     email = data.get('email')
     otp = data.get('otp')
     
@@ -696,24 +700,73 @@ def _session_name_matches_registered_profile(registered_name, session_candidate_
     )
 
 
+def _upload_form_name_matches_account_profile(registered_name: str, typed_name: str):
+    """
+    Full Name on the interview form must align with the signed-in user's profile name
+    (same person — prevents uploading someone else's resume under a different label).
+    """
+    typ = re.sub(r"\s+", " ", (typed_name or "").strip().lower())
+    if not typ or typ in ("unknown", "n/a", "na", "none"):
+        return False, "Enter your full name exactly as it appears on your account profile."
+    reg = re.sub(r"\s+", " ", (registered_name or "").strip().lower())
+    if not reg:
+        return True, None
+    if reg == typ:
+        return True, None
+    rt = set(reg.split())
+    tt = set(typ.split())
+    if tt <= rt or rt <= tt:
+        return True, None
+    return (
+        False,
+        f"The name you entered must match your account profile name ({registered_name.strip()}). "
+        "Update your name on the dashboard under Account Settings, or type the same name here.",
+    )
+
+
+def _safe_remove_file_under_upload_root(path, upload_root):
+    """Delete a file only if its real path is inside upload_root (avoids path traversal)."""
+    if not path or not upload_root:
+        return
+    try:
+        root_abs = os.path.realpath(os.path.abspath(upload_root))
+        file_abs = os.path.realpath(os.path.abspath(path))
+        if file_abs == root_abs or not file_abs.startswith(root_abs + os.sep):
+            return
+        if os.path.isfile(file_abs):
+            os.remove(file_abs)
+            log.info("Removed previous upload file: %s", file_abs)
+    except OSError as e:
+        log.debug("safe_remove_file_under_upload_root: %s", e)
+
+
 @app.route('/api/auth/verify_face', methods=['POST'])
 def verify_face():
     data = request.json
     user_id = data.get('user_id')
     live_image = data.get('image')
+    try:
+        user_id_int = int(user_id) if user_id is not None else None
+    except (TypeError, ValueError):
+        user_id_int = None
     wf_session, wf_err = _load_workflow_session(
         required_states=[STATE_RESUME_UPLOADED, STATE_FACE_VERIFIED]
     )
     if wf_err:
         return wf_err
     
-    if not user_id or not live_image:
+    if not user_id_int or not live_image:
          return jsonify({"status": "error", "message": "Missing ID or Image"}), 400
          
-    stored_photo = database.get_user_photo(user_id)
+    stored_photo = database.get_user_photo(user_id_int)
     if not stored_photo:
-         print(f"🚨 CRITICAL: No profile photo found for {user_id}. Blocking verification.")
-         return jsonify({"status": "error", "message": "Identity Error: No registered profile photo found. Please create another account with your face."}), 403
+         print(f"🚨 CRITICAL: No profile photo found for {user_id_int}. Blocking verification.")
+         return jsonify({
+             "status": "error",
+             "code": "NO_PROFILE_PHOTO",
+             "message": "Identity Error: No registered profile photo found. Upload a clear front-facing photo below, then authenticate again.",
+             "allow_profile_reupload": True,
+         }), 403
     # REAL COMPARISON LOGIC WOULD GO HERE using deepface/face_recognition
     # For this environment, we enforce that both images effectively exist.
     # We can add a simple string comparison if it's the SAME exact base64 (unlikely)
@@ -728,7 +781,12 @@ def verify_face():
         frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         if frame is None:
             print("Error: verify_face: Failed to decode live image.")
-            return jsonify({"status": "error", "message": "Failed to decode image from camera. Please try again."}), 400
+            return jsonify({
+                "status": "error",
+                "code": "BAD_LIVE_IMAGE",
+                "message": "Failed to decode image from camera. Please try again.",
+                "allow_profile_reupload": False,
+            }), 400
 
         # Decode Profile Image
         if "," in stored_photo: p_data = stored_photo.split(",")[1]
@@ -739,10 +797,15 @@ def verify_face():
         
         if p_frame is None:
              print("Error: verify_face: Failed to decode stored profile photo.")
-             return jsonify({"status": "error", "message": "Corrupt profile photo. Please re-upload your photo in dashboard."}), 400
+             return jsonify({
+                 "status": "error",
+                 "code": "BAD_PROFILE_IMAGE",
+                 "message": "Corrupt profile photo. Please upload a new front-facing photo below.",
+                 "allow_profile_reupload": True,
+             }), 400
 
         # 0. Name consistency: account holder vs resume session name (global manager may carry prior session)
-        user_row = database.get_user_by_id(int(user_id))
+        user_row = database.get_user_by_id(user_id_int)
         reg_name = (user_row or {}).get("name")
         wf_ctx = wf_session.get("context") or {}
         session_name = (
@@ -753,36 +816,58 @@ def verify_face():
         ).strip()
         name_ok, name_msg = _session_name_matches_registered_profile(reg_name, session_name)
         if not name_ok:
-            print(f"❌ [AUTH] Name mismatch for user {user_id}: registered={reg_name!r} session={session_name!r}")
-            return jsonify({"status": "error", "message": name_msg}), 403
-
-        # 1. Face match — always rebuild baseline from THIS user's stored photo (shared manager safety)
-        print("🔄 [AUTH] Loading profile face baseline for current user...")
-        manager.get_face_encoding_from_base64(stored_photo)
-        if manager.profile_face_hist is None:
+            log.warning(
+                "[AUTH] Name mismatch for user %s: registered=%r session=%r",
+                user_id_int,
+                reg_name,
+                session_name,
+            )
             return jsonify({
                 "status": "error",
-                "message": "Could not read a face from your profile photo. Update it in Dashboard with a clear front-facing picture.",
+                "code": "NAME_MISMATCH",
+                "message": name_msg,
+                "allow_profile_reupload": False,
             }), 403
 
-        matched, feedback = manager.verify_face_match(frame)
+        # 1. Face + periocular (eye-region) match — same logic as continuous proctoring
+        import identity_compare
+
+        log.info("[AUTH] Comparing live capture to stored profile (face + periocular)")
+        matched, feedback, fc, ee, combined, match_code = identity_compare.compare_histogram_identity(
+            p_frame, frame, mode="verify"
+        )
+        log.info(
+            "[AUTH] Identity scores face=%s eye=%s combined=%s code=%s",
+            f"{fc:.3f}" if fc is not None else "n/a",
+            f"{ee:.3f}" if ee is not None else "n/a",
+            f"{combined:.3f}" if combined is not None else "n/a",
+            match_code,
+        )
         
         if matched:
              # Set the PROFILE PHOTO as the baseline for continuous verification
              proctor_service.set_reference_profile(p_frame)
-             print(f"✅ Identity Baseline established for user {user_id}")
+             log.info("[AUTH] Identity baseline established for user %s", user_id_int)
              # Sync session and record successful verification snapshot
              proctor_service.session_id = manager.session_id
              proctor_service.save_evidence(frame, "Identity Verified")
         else:
-             print(f"❌ Mismatch: Identity Verification Failed for user {user_id}: {feedback}")
+             log.warning(
+                 "[AUTH] Identity verification failed for user %s: %s",
+                 user_id_int,
+                 feedback,
+             )
+             allow_reupload = match_code in ("FACE_MISMATCH", "NO_FACE_PROFILE")
              return jsonify({
-                 "status": "error", 
-                 "message": f"Identity Not Matched: {feedback}. Please ensure you are visible and match the resume photo."
+                 "status": "error",
+                 "code": match_code,
+                 "message": f"Identity not matched: {feedback}",
+                 "allow_profile_reupload": allow_reupload,
+                 "detail": feedback,
              }), 403
 
         # High confidence success if Face matched
-        print(f"✨ Success: Identity Verified for user {user_id}")
+        log.info("[AUTH] Identity verified for user %s", user_id_int)
         if can_transition(wf_session.get("current_state"), STATE_FACE_VERIFIED):
             wf_ctx["face_verified"] = True
             wf_ctx["face_verified_at"] = datetime.now().isoformat()
@@ -790,19 +875,19 @@ def verify_face():
                 wf_session["session_id"], state=STATE_FACE_VERIFIED, context=wf_ctx
             )
 
+        conf = float(combined) if combined is not None else float(fc)
         return jsonify(
             {
                 "status": "success",
                 "message": "Identity Verified",
-                "confidence": 0.99,
+                "code": "MATCH",
+                "confidence": round(min(0.999, max(0.5, conf)), 4),
                 "session_id": wf_session["session_id"],
                 "current_state": STATE_FACE_VERIFIED,
                 "should_terminate": proctor_service.should_terminate,
                 "termination_reason": proctor_service.termination_reason,
             }
         )
-
-        
     except Exception as e:
         import traceback
         traceback_str = traceback.format_exc()
@@ -821,8 +906,11 @@ def verify_face():
 def forgot_password():
     # CORS is handled globally
     
-    print(f"\n🔍 [FORGOT PASSWORD] Route HIT! Request: {request.json}")
-    data = request.json
+    log.info(
+        "[FORGOT PASSWORD] Request payload: %s",
+        json.dumps(request.get_json(silent=True) or {}, ensure_ascii=True),
+    )
+    data = request.get_json(silent=True) or {}
     email = data.get('email')
     
     if not email:
@@ -855,7 +943,10 @@ def forgot_password():
 @app.route('/api/auth/resend-otp', methods=['POST'])
 def resend_otp():
     """Generic endpoint to resend OTP for both Admin and Password Recovery."""
-    print(f"\n🔄 [RESEND OTP] Route HIT! Request: {request.json}")
+    log.info(
+        "[RESEND OTP] Request payload: %s",
+        json.dumps(request.get_json(silent=True) or {}, ensure_ascii=True),
+    )
     data = request.json
     email = data.get('email')
     
@@ -891,7 +982,7 @@ def resend_otp():
 
 @app.route('/api/auth/verify-otp', methods=['POST'])
 def verify_otp():
-    data = request.json
+    data = request.get_json(silent=True) or {}
     email = data.get('email')
     otp = data.get('otp')
     
@@ -1000,7 +1091,7 @@ def init_session():
 
 @app.route('/api/auth/reset-password', methods=['POST'])
 def reset_password():
-    data = request.json
+    data = request.get_json(silent=True) or {}
     email = data.get('email')
     new_password = data.get('new_password')
     
@@ -1029,7 +1120,17 @@ def update_profile():
         
         if not user_id or not name or not email:
             return jsonify({"status": "error", "message": "Required fields: name, email"}), 400
-            
+
+        upload_root = app.config["UPLOAD_FOLDER"]
+        old_resume_path = None
+        try:
+            uid_key = int(user_id)
+            row = database.get_user_row_by_id(uid_key)
+            if row:
+                old_resume_path = dict(row).get("resume_path")
+        except (TypeError, ValueError):
+            pass
+
         resume_path = None
         if resume_base64:
             try:
@@ -1037,10 +1138,10 @@ def update_profile():
                 if "," in resume_base64:
                     resume_base64 = resume_base64.split(",")[1]
                 resume_bytes = base64.b64decode(resume_base64)
-                
+
                 filename = secure_filename(f"resume_{user_id}_{int(time.time())}.pdf")
-                resume_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-                
+                resume_path = os.path.join(upload_root, filename)
+
                 with open(resume_path, "wb") as f:
                     f.write(resume_bytes)
             except Exception as e:
@@ -1052,16 +1153,81 @@ def update_profile():
         domain = data.get('domain')
 
         success, error = database.update_user_profile(user_id, name, email, phone, college_name, year, photo, resume_path, register_no, branch, domain)
-        if success:
-            updated_user = database.get_user_by_id(user_id)
-            if not updated_user:
-                 return jsonify({"status": "error", "message": "User not found after update"}), 404
-            return jsonify({"status": "success", "user": updated_user})
-        else:
+        if not success:
+            if resume_path and os.path.isfile(resume_path):
+                _safe_remove_file_under_upload_root(resume_path, upload_root)
             return jsonify({"status": "error", "message": error}), 400
+
+        if resume_path and old_resume_path and str(old_resume_path) != str(resume_path):
+            _safe_remove_file_under_upload_root(old_resume_path, upload_root)
+
+        if photo:
+            log.info("[profile] user %s profile photo payload replaced in database", user_id)
+
+        updated_user = database.get_user_by_id(user_id)
+        if not updated_user:
+            return jsonify({"status": "error", "message": "User not found after update"}), 404
+        return jsonify({"status": "success", "user": updated_user})
     except Exception as e:
         print(f"Profile Update Critical Error: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route("/api/user/profile/photo", methods=["POST"])
+def update_profile_photo_only():
+    """Update signed-in user's profile picture (for re-verify after face mismatch)."""
+    try:
+        data = request.json or {}
+        user_id = data.get("user_id") or data.get("id")
+        photo = data.get("photo")
+        session_id = data.get("session_id")
+        if not user_id or not photo:
+            return jsonify({"status": "error", "message": "user_id and photo are required"}), 400
+        try:
+            uid = int(user_id)
+        except (TypeError, ValueError):
+            return jsonify({"status": "error", "message": "Invalid user_id"}), 400
+        if not isinstance(photo, str) or len(photo) < 50:
+            return jsonify({"status": "error", "message": "Invalid photo payload"}), 400
+        ok = database.update_user_photo(uid, photo.strip())
+        if not ok:
+            return jsonify({"status": "error", "message": "Could not update photo"}), 400
+        log.info("[profile] user %s profile photo replaced via /api/user/profile/photo", uid)
+        # New profile image invalidates prior face match — must re-authenticate before interview APIs.
+        if session_id and isinstance(session_id, str):
+            wf = database.get_workflow_session(session_id.strip())
+            if wf:
+                wf_uid = wf.get("user_id")
+                if wf_uid is not None and int(wf_uid) != uid:
+                    log.warning(
+                        "[AUTH] profile/photo session_id user mismatch: session user=%s body user=%s",
+                        wf_uid,
+                        uid,
+                    )
+                else:
+                    st = wf.get("current_state")
+                    if st in (STATE_FACE_VERIFIED, STATE_INTERVIEW_IN_PROGRESS) and can_transition(
+                        st, STATE_RESUME_UPLOADED
+                    ):
+                        ctx = dict(wf.get("context") or {})
+                        ctx["face_verified"] = False
+                        ctx.pop("face_verified_at", None)
+                        database.update_workflow_session(
+                            session_id.strip(), state=STATE_RESUME_UPLOADED, context=ctx
+                        )
+                        log.info(
+                            "[AUTH] Workflow %s reset to %s after profile photo update",
+                            (session_id[:16] + "…") if len(session_id) > 16 else session_id,
+                            STATE_RESUME_UPLOADED,
+                        )
+        updated = database.get_user_by_id(uid)
+        if not updated:
+            return jsonify({"status": "error", "message": "User not found"}), 404
+        return jsonify({"status": "success", "user": updated})
+    except Exception as e:
+        log.exception("update_profile_photo_only")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
 
 @app.route('/api/user/delete', methods=['POST'])
 def delete_own_account():
@@ -1221,7 +1387,7 @@ def upload_resume():
 
     if topic:
         manager.set_module_topic(topic)
-        print(f" 🎯 [MODULE] Interview session starting for Module: {topic}")
+        log.info("[MODULE] Interview session starting for module: %s", topic)
     else:
         manager.set_module_topic(None)
 
@@ -1235,15 +1401,34 @@ def upload_resume():
             }), 403
         
         # NOTE: Credit consumption moved to get_interview_question (Step 0) to prevent double-burn in case of errors.
-        print(f"💳 [Credits Check] User {user_id} has active credits.")
-    print(f" - Filename: {file.filename}")
+        log.info("[Credits] User %s has active credits", user_id)
+    log.info("[upload_resume] filename=%s", file.filename)
     
     if file.filename == '':
         return jsonify({"status": "error", "message": "No file selected"}), 400
     
     if not allowed_file(file.filename):
         return jsonify({"status": "error", "message": "Only PDF files are allowed"}), 400
-    
+
+    # --- Signed-in user: Full Name on form must match account profile (before saving file) ---
+    if user_id and str(user_id).lower() not in ("undefined", "null", ""):
+        try:
+            uid = int(user_id)
+            acc = database.get_user_by_id(uid)
+            if acc and acc.get("name"):
+                ok_align, align_msg = _upload_form_name_matches_account_profile(acc["name"], candidate_name)
+                if not ok_align:
+                    resume_uploaded = False
+                    return jsonify(
+                        {
+                            "status": "error",
+                            "code": "PROFILE_NAME_MISMATCH",
+                            "message": align_msg,
+                        }
+                    ), 403
+        except (ValueError, TypeError):
+            pass
+
     # --- CLEANUP PREVIOUS RESUMES (DISK PROTECTION) ---
     # To save space, we search for and delete any old resumes uploaded by this same person.
     timestamp = time.strftime("%Y%m%d_%H%M%S")
@@ -1252,7 +1437,7 @@ def upload_resume():
         if safe_candidate_name in old_file:
             try:
                 os.remove(os.path.join(app.config['UPLOAD_FOLDER'], old_file))
-                print(f"🗑️ Deleted old resume for {candidate_name} to save disk space.")
+                log.info("Deleted old resume file for candidate: %s", candidate_name)
             except OSError as ex:
                 log.debug("Old resume delete skipped: %s", ex)
 
@@ -1267,9 +1452,9 @@ def upload_resume():
     if user_id and str(user_id).lower() not in ['undefined', 'null', '']:
         try:
             database.update_resume_path(int(user_id), filepath)
-            print(f" [DB] Updated resume path for User ID: {user_id}")
+            log.info("[DB] Updated resume path for user_id=%s", user_id)
         except Exception as db_err:
-            print(f" ⚠️ [DB ERROR] Failed to update resume path: {db_err}")
+            log.warning("[DB] Failed to update resume path: %s", db_err)
     
     # Fetch User Plan and Update Manager Flow
     plan_id = 0
@@ -1279,9 +1464,9 @@ def upload_resume():
             if user_data:
                 plan_id = user_data.get('plan_id', 0)
                 manager.update_flow_for_plan(plan_id)
-                print(f" ✅ [FLOW SYNC] Interview Manager set to Plan {plan_id}")
+                log.info("[FLOW] Interview manager set to plan %s", plan_id)
         except Exception as flow_err:
-            print(f" ⚠️ [FLOW SYNC ERROR] {flow_err}")
+            log.warning("Flow sync error: %s", flow_err)
 
     # Process with Manager
     success, msg = manager.load_resume(filepath)
@@ -1305,17 +1490,21 @@ def upload_resume():
     if not success:
          return jsonify({"status": "error", "message": msg}), 400
 
-    bypass = request.form.get('bypass_name_check') == 'true'
     match, detected_name = manager.verify_candidate_match(candidate_name, manager.resume_text)
-    
-    if not match and not bypass:
-         resume_uploaded = False
-         return jsonify({
-             "status": "error", 
-             "message": "Identity Not Matched: The candidate name on your resume does not match your registered profile name. Please ensure they match exactly."
-         }), 403 # Changed from warning to error (403 Forbidden)
 
-
+    if not match:
+        resume_uploaded = False
+        return jsonify(
+            {
+                "status": "error",
+                "code": "RESUME_NAME_MISMATCH",
+                "message": (
+                    "The name you entered does not match the name on this PDF resume. "
+                    "Use the same legal name as in the document (or upload your own resume)."
+                ),
+                "detected_hint": detected_name if isinstance(detected_name, str) and detected_name not in ("Mismatch", "Unknown", "Error", "Missing info") else None,
+            }
+        ), 403
     manager.candidate_name = candidate_name
     # Run resume analysis in background to avoid blocking UI during upload/parsing
     import threading
@@ -1342,13 +1531,11 @@ def upload_resume():
                 year='Unknown',
                 photo=manager.candidate_photo
             )
-            print(f" ✅ [MANAGER] Updated User {user_id} profile photo with resume portrait.")
+            log.info("[MANAGER] Updated user %s profile photo from resume portrait", user_id)
         except Exception as ex:
             log.debug("update_user_profile after resume: %s", ex)
 
-    print(f"\n{'='*60}")
-    print(f"Resume uploaded & Verified: {candidate_name}")
-    print(f"{'='*60}\n")
+    log.info("Resume uploaded and verified for %s", candidate_name)
     
     # Session workflow persistence
     incoming_sid = _request_session_id()
@@ -1519,14 +1706,14 @@ def submit_answer():
                     print(f" 🔄 [MID-SESSION] Plan changed {manager.plan_id} → {plan_id}. Step preserved at {old_step}.")
         except Exception: pass
 
-    # 1. Evaluate synchronously so each answer (verbatim) and scores are persisted before the next step / report
-    manager.evaluate_answer(question, answer)
-    
-    # 2. STRICT FLOW CONTROL: Automatically get next category
+    # 1. Next question first (latency): evaluation runs in background; scores land before typical next answer.
     next_cat = manager.get_next_category()
-    
-    # 3. Generate the next question immediately
     next_q = manager.generate_question(next_cat, previous_answer=answer)
+
+    threading.Thread(
+        target=lambda q=question, a=answer: manager.evaluate_answer(q, a),
+        daemon=True,
+    ).start()
     
     wf_ctx = wf_session.get("context") or {}
     answers = wf_ctx.get("answers") or []
@@ -1730,6 +1917,10 @@ def finish_interview():
                             os.remove(pdf_path)
                         except Exception:
                             pass
+                        try:
+                            manager.cleanup_session()
+                        except Exception as _disk_cl:
+                            log.debug("cleanup_session after email PDF: %s", _disk_cl)
                     else:
                         report_email_message = "PDF generation failed for email"
                 except Exception as _em_err:
@@ -1788,8 +1979,30 @@ def finish_interview():
 
 @app.route('/api/interview/reset', methods=['POST'])
 def interview_reset_api():
-    manager.reset()
-    return jsonify({"status": "success", "message": "Interview state reset"})
+    """
+    Clear scored interview progress for a new run without destroying resume, flow, or session_id.
+    Full manager.reset() was breaking workflow + proctor alignment and made monitoring look 'dead'.
+    """
+    try:
+        with manager.lock:
+            manager.history = []
+            manager.evaluations = []
+            manager.current_step = 0
+            manager.submitted_solutions = []
+            manager.violations = []
+            manager.asked_topics = []
+            manager.icebreaker_stage = "start"
+            manager.icebreaker_count = 0
+            manager.credit_consumed = False
+        proctor_service.should_terminate = False
+        proctor_service.termination_reason = None
+        proctor_service.violations = []
+        proctor_service.session_id = manager.session_id
+        proctor_service.start()
+        return jsonify({"status": "success", "message": "Interview state reset"})
+    except Exception as ex:
+        log.exception("interview_reset_api: %s", ex)
+        return jsonify({"status": "error", "message": str(ex)}), 500
 
 @app.route('/api/report', methods=['GET'])
 def get_report():
@@ -2238,7 +2451,10 @@ def global_logout():
     """Explicitly clears all server-side global state for the current session."""
     global resume_uploaded, current_candidate_info, proctor_service, violations, proctor_active, proctor_start_time
     
-    print(f"[AUTH] Global logout triggered for {current_candidate_info.get('name', 'Unknown')}")
+    log.info(
+        "[AUTH] Global logout triggered for %s",
+        current_candidate_info.get('name', 'Unknown'),
+    )
     
     # 1. Reset Proctoring
     if proctor_service:

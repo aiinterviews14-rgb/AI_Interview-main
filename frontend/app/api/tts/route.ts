@@ -15,8 +15,8 @@ export async function POST(req: Request) {
     console.log("🔊 Proxying TTS request to Masculine Backend:", text.slice(0, 50), "...");
 
     // Call the hardened Flask backend which prioritizes Male voices (pyttsx3/edge-tts)
-    // Use NEXT_PUBLIC_API_URL or fallback to backend service in Docker, or localhost for local
-    const internalBackendUrl = process.env.INTERNAL_BACKEND_URL || process.env.NEXT_PUBLIC_API_URL || "http://backend:5000";
+    // Default to localhost so local development works without containers.
+    const internalBackendUrl = process.env.INTERNAL_BACKEND_URL || process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:5000";
     const backendUrl = `${internalBackendUrl}/api/tts?text=${encodeURIComponent(text)}`;
     const response = await fetch(backendUrl);
 

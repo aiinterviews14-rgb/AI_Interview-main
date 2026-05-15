@@ -20,7 +20,7 @@ pip install -r requirements-core.txt
 
 - **Module:** `run_proctor_server.py` exposes `app` (Flask) with only proctoring endpoints + `GET /health`.
 - **Run locally:** `set PROCTOR_PORT=5051` then `python run_proctor_server.py`.
-- **Responsibility:** Same `/proctor/*` and `/api/start_monitoring` / `/api/stop_monitoring` handlers, isolated for a **separate container** or GPU host.
+- **Responsibility:** Same `/proctor/*` and `/api/start_monitoring` / `/api/stop_monitoring` handlers, isolated for a separate process or GPU host.
 
 Install:
 
@@ -28,7 +28,7 @@ Install:
 pip install -r requirements-proctor.txt
 ```
 
-## Same machine vs two containers
+## Same machine vs two processes
 
 | Mode | What to run |
 |------|-------------|
@@ -40,20 +40,6 @@ pip install -r requirements-proctor.txt
 - `services/proctor_routes.py` — Flask **blueprint** with all proctor HTTP routes.
 - `api.py` — Registers the blueprint after creating `manager` and `proctor_service`.
 
-## Docker (example)
+## Production note
 
-Build two images from the same `backend/` context; both may use `requirements.txt` until you slim `requirements-core.txt`.
-
-- Image A: see `backend/Dockerfile` — `gunicorn` with `GUNICORN_WORKERS` default **1**, worker class **gthread** (do not raise workers until interview state is shared outside the process). Env: `CORS_ORIGINS`, `GUNICORN_WORKERS`, `GUNICORN_THREADS`, `DB_INIT_RETRIES` / `DB_INIT_RETRY_DELAY`.
-- Image B: `run_proctor_server:app` (same gthread + single-worker pattern in `backend/deploy/Dockerfile.proctor`).
-
-Point the frontend `VITE_*` / proxy base URL for proctor endpoints to image B only when you have a proper routing/session story.
-
-## Example Docker builds
-
-From the **repository root** (parent of `backend/`):
-
-```bash
-docker build -f backend/deploy/Dockerfile.api -t ai-interview-api .
-docker build -f backend/deploy/Dockerfile.proctor -t ai-interview-proctor .
-```
+If you run two backend processes in production, keep proctor traffic sticky to one process per active interview session. The interview manager is in-memory and not shared across independent workers.

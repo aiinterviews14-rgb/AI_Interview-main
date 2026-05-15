@@ -8,7 +8,6 @@ import {
     Award,
     TrendingUp,
     Search,
-    Bell,
     LogOut,
     Sun,
     Moon,
@@ -357,7 +356,11 @@ export default function AdminDashboard() {
         localStorage.removeItem('admin_session');
         localStorage.removeItem('user_session');
         localStorage.removeItem('resume_uploaded');
-        window.location.href = '/';
+        const baseUrl = typeof window !== 'undefined'
+            ? (process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5000')
+            : (process.env.INTERNAL_BACKEND_URL || 'http://backend:5000');
+        fetch(`${baseUrl}/api/auth/logout`, { method: 'POST' }).catch(() => {});
+        window.location.href = '/admin-login';
     };
 
     if (isLoading) {
@@ -448,10 +451,12 @@ export default function AdminDashboard() {
                         <button onClick={handleExportExcel} className="flex items-center gap-2 px-4 py-2.5 bg-emerald-700 text-white rounded-xl font-bold text-sm shadow-lg hover:shadow-emerald-500/20 hover:scale-105 transition-all flex-shrink-0">
                             <FileSpreadsheet size={16} /> <span className="hidden sm:block">Export Excel</span>
                         </button>
-                        <div className="w-10 h-10 bg-[var(--card-bg)] border border-[var(--border)] rounded-full flex items-center justify-center relative cursor-pointer hover:bg-[var(--nav-bg)] transition-all">
-                            <Bell size={18} className="text-[var(--text-muted)]" />
-                            <span className="absolute top-0 right-0 w-3 h-3 bg-red-500 rounded-full border-2 border-white"></span>
-                        </div>
+                        <button
+                            onClick={handleAdminLogout}
+                            className="flex items-center gap-2 px-4 py-2.5 bg-red-50 text-red-600 border border-red-200 rounded-xl font-bold text-sm hover:bg-red-100 transition-all flex-shrink-0"
+                        >
+                            <LogOut size={16} /> <span className="hidden sm:block">Logout</span>
+                        </button>
                     </div>
                 </div>
 

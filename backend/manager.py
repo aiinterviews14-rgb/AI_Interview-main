@@ -4,6 +4,7 @@ import json
 import time
 import threading
 import datetime
+import logging
 import PyPDF2
 import random
 from groq import Groq
@@ -23,6 +24,28 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, Tabl
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
 from reportlab.lib.enums import TA_LEFT
+
+log = logging.getLogger(__name__)
+
+
+def _normalize_plan_id(plan_id):
+    """Coerce DB plan_id (int, numeric str, or 'free') to int for interview flow logic."""
+    if plan_id is None:
+        return 0
+    if isinstance(plan_id, bool):
+        return int(plan_id)
+    if isinstance(plan_id, int):
+        return plan_id
+    s = str(plan_id).strip().lower()
+    if s in ("", "free", "none", "null"):
+        return 0
+    if s.isdigit():
+        return int(s)
+    try:
+        return int(float(s))
+    except (ValueError, TypeError):
+        return 0
+
 
 class InterviewManager:
 
@@ -60,7 +83,9 @@ class InterviewManager:
         self.module_topic = None # New: Specialized Assessment Module Topic (e.g. System Design)
         self.evidence_images = []  # Pre-decoded (path, label) tuples for past report generation
         self.candidate_photo = None # Base64 extracted photo from resume
-        self.profile_face_hist = None # NEW: Pre-computed face histogram for lightweight identity verification
+        self.profile_face_hist = None # Pre-computed face histogram (legacy / helpers)
+        self.profile_eye_hist = None # Periocular histogram
+        self.profile_identity_bgr = None # Last decoded profile BGR for identity_compare
         self.icebreaker_stage = 'start'
         self.icebreaker_count = 0
         self.max_icebreakers = 2
@@ -72,8 +97,8 @@ class InterviewManager:
         self.current_step = 0
         self.interview_flow = self._get_default_flow()
 
-    def reset(self): 
-        print("🔥 RESET FUNCTION CALLED")
+    def reset(self):
+        print("[MANAGER] Reset function called")
 
         with self.lock:
             self.history = []
@@ -103,6 +128,8 @@ class InterviewManager:
             self.current_step = 0
             self.credit_consumed = False
             self.profile_face_hist = None
+            self.profile_eye_hist = None
+            self.profile_identity_bgr = None
 
             if hasattr(self, 'evidence_path'):
                 self.evidence_path = None
@@ -133,7 +160,6 @@ class InterviewManager:
         return [
             "greeting",
             "warmup",
-            "warmup",
             "intro",
             "resume_skills",
             "resume_projects",
@@ -157,11 +183,11 @@ class InterviewManager:
         """Sets a specialized assessment topic (e.g. System Design, Technical Core)."""
         self.module_topic = topic
         if topic:
-            print(f" ð¯ [MANAGER] Session Module set to: {topic}")
+            log.info("[MANAGER] Session module set to: %s", topic)
 
     def update_flow_for_plan(self, plan_id, practice_section=None):
         """Adjusts depth and length of interview based on plan ID or Practice Mode"""
-        self.plan_id = int(plan_id)
+        self.plan_id = _normalize_plan_id(plan_id)
         self.practice_mode = practice_section is not None
         self.practice_section = practice_section
         self.current_step = 0 # Restart always when plan context changes
@@ -183,7 +209,7 @@ class InterviewManager:
                 self.interview_flow = ["greeting", "scenario_behavioral", "scenario_hr", "teamwork", "conclusion"]
             else:
                 self.interview_flow = ["greeting", "warmup", "conclusion"]
-            print(f"ð¯ [FLOW] Practice Mode Activated: {practice_section}")
+            log.info("[FLOW] Practice mode activated: %s", practice_section)
         # 2. HANDLE STANDARD PLAN FLOW
         elif self.plan_id == 1:
             # Starter: basics → resume skills/projects from CV → behavioral → coding → HR → close
@@ -200,32 +226,32 @@ class InterviewManager:
                 "scenario_hr",
                 "conclusion"
             ]
-            print(f"ð [FLOW] Reduced Interview Flow for Starter Plan (Plan 1)")
+            log.info("[FLOW] Reduced interview flow for Starter plan (plan 1)")
         elif self.plan_id == 2:
             # ATS Pro: basics → resume (skills, projects, overview from CV) → rest; HR after coding
             self.interview_flow = [
-                "greeting", "warmup", "warmup", "intro",
+                "greeting", "warmup", "intro",
                 "resume_skills", "resume_projects", "resume_overview",
                 "scenario_technical", "technical_core", "technical_advanced",
                 "case_study", "scenario_behavioral",
                 "code", "code", "scenario_hr", "conclusion"
             ]
-            print(f"ð [FLOW] Standard Flow for ATS Pro Plan (Plan 2)")
+            log.info("[FLOW] Standard flow for ATS Pro plan (plan 2)")
         elif self.plan_id == 3:
             # Proctor Elite: basics → resume from CV → …; HR after coding
             self.interview_flow = [
-                "greeting", "warmup", "warmup", "intro",
+                "greeting", "warmup", "intro",
                 "resume_skills", "resume_projects", "resume_overview",
                 "scenario_technical", "technical_core", "technical_advanced",
                 "case_study", "scenario_behavioral",
                 "code", "code",
                 "scenario_hr", "leadership", "teamwork", "adaptability", "conclusion"
             ]
-            print(f"ð¡ï¸ [FLOW] Full Flow for Proctor Elite Plan (Plan 3)")
+            log.info("[FLOW] Full flow for Proctor Elite plan (plan 3)")
         elif self.plan_id == 4:
             # Ultimate Bundle (Plan 4): The exhaustive "Elite Ultra" flow
             self.interview_flow = self._get_default_flow()
-            print(f"ð [FLOW] Full Elite Flow Activated (Plan {self.plan_id})")
+            log.info("[FLOW] Full elite flow activated (plan %s)", self.plan_id)
         else:
             # Default/Free/Unknown: exactly 5 scored questions; next step resolves to conclusion on the backend
             self.interview_flow = [
@@ -235,7 +261,7 @@ class InterviewManager:
                 "resume_projects",
                 "technical_core",
             ]
-            print(f"ð [FLOW] Demo Flow (5 questions) Activated (Plan {self.plan_id})")
+            log.info("[FLOW] Demo flow (5 questions) activated (plan %s)", self.plan_id)
         with self.lock:
             self.history = []
             self.evaluations = []
@@ -249,7 +275,7 @@ class InterviewManager:
             self.icebreaker_stage = 'start'
             self.current_step = 0 # Reset flow step
             self.session_id = str(int(time.time())) # New session ID on reset
-            print("ð Interview State Reset Successfully")
+            log.info("[FLOW] Interview state reset successfully")
         # Fresh random coding pair for this flow (200-problem pool)
         self._refresh_session_coding_problems()
 
@@ -334,17 +360,38 @@ class InterviewManager:
         except: pass
 
     def verify_candidate_match(self, name, resume_text):
-        """Checks if registration name matches resume content."""
-        if not name or not resume_text: return False, "Missing info"
-        if name.lower() in resume_text.lower(): return True, name
-        if not self.client: return False, "Unknown"
-        prompt = f"Does '{name}' match any name in this resume? Snippet: {resume_text[:400]}. Return 'YES: [Name]' or 'NO'."
+        """Checks that the typed candidate name appears as the person's name on the resume (word-level)."""
+        if not name or not resume_text:
+            return False, "Missing info"
+        name_clean = name.strip()
+        if not name_clean:
+            return False, "Missing info"
+        body = resume_text.lower()
+        tokens = [t for t in re.split(r"\s+", name_clean.lower()) if t and len(t) >= 2]
+        if not tokens:
+            tokens = [name_clean.lower()]
+        for tok in tokens:
+            pat = r"(?<![a-z0-9])" + re.escape(tok) + r"(?![a-z0-9])"
+            if not re.search(pat, body, re.IGNORECASE):
+                break
+        else:
+            return True, name_clean
+        if not self.client:
+            return False, "The name you entered was not found on this resume. Check spelling or upload the correct PDF."
+        prompt = (
+            f"Interview candidate claims their full name is: \"{name_clean}\".\n"
+            f"Does this resume clearly belong to that person (same person in header, about, or signature)? "
+            f"Answer strictly YES or NO only. First 900 characters of resume:\n{resume_text[:900]}"
+        )
         try:
-            res = self.client.chat.completions.create(model=self.model_name, messages=[{"role": "user", "content": prompt}]).choices[0].message.content
-            if 'YES' in res.upper():
-                return True, res.split(':')[-1].strip() if ':' in res else name
+            res = self.client.chat.completions.create(
+                model=self.model_name, messages=[{"role": "user", "content": prompt}], temperature=0.0
+            ).choices[0].message.content
+            if re.search(r"\bYES\b", (res or "").upper()):
+                return True, name_clean
             return False, "Mismatch"
-        except: return False, "Error"
+        except Exception:
+            return False, "Error"
 
     def analyze_resume(self):
         """Runs background ATS analysis."""
@@ -1128,6 +1175,60 @@ class InterviewManager:
                 story.append(safe_para(f"<i>…and {len(unusual_list) - 48} additional event(s); full history retained in system records.</i>", s_small, True))
         story.append(gap_md)
 
+        # Thumbnails for any logged incident that has a proof file on disk
+        viz_events = []
+        for v in unusual_list[:32]:
+            ip = v.get("image_path")
+            if ip and isinstance(ip, str) and os.path.isfile(ip):
+                viz_events.append((ip, v))
+        if viz_events:
+            ev_lbl_incident = ParagraphStyle(
+                'EvInc', fontSize=7, alignment=TA_CENTER, fontName='Helvetica-Bold', textColor=C_MUTED, leading=9
+            )
+            story.append(
+                KeepTogether(
+                    [
+                        safe_para("VISUAL INCIDENT EVIDENCE (CAPTURED FRAMES)", s_head),
+                        safe_para(
+                            "Frames saved for logged integrity events (e.g. session termination, device-in-frame, identity checks).",
+                            s_small,
+                        ),
+                    ]
+                )
+            )
+            for i in range(0, len(viz_events), 3):
+                chunk = viz_events[i : i + 3]
+                img_row, lbl_row = [], []
+                for ip, v in chunk:
+                    try:
+                        img_row.append(Image(ip, width=2.15 * inch, height=1.5 * inch))
+                        cap = f"{str(v.get('type') or '')[:44]} · {str(v.get('timestamp') or '')[:22]}"
+                        lbl_row.append(safe_para(cap, ev_lbl_incident))
+                    except Exception:
+                        img_row.append(Spacer(2.15 * inch, 1.5 * inch))
+                        lbl_row.append(RLParagraph("", ev_lbl_incident))
+                while len(img_row) < 3:
+                    img_row.append(Spacer(2.15 * inch, 1.5 * inch))
+                    lbl_row.append(RLParagraph("", ev_lbl_incident))
+                if not any(isinstance(c, Image) for c in img_row):
+                    continue
+                ev_blk2 = Table(
+                    [img_row, lbl_row],
+                    colWidths=[2.35 * inch] * 3,
+                )
+                ev_blk2.setStyle(
+                    TableStyle(
+                        [
+                            ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                            ("TOPPADDING", (0, 0), (-1, -1), 4),
+                            ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+                        ]
+                    )
+                )
+                story.append(ev_blk2)
+                story.append(gap_sm)
+
         # --- Technical skills analysis (summary rows) ---
         tech_acc_j = "Response correctness and depth across verbal interview modules."
         code_j = "Automated checks and rubric on submitted coding solutions." if coding_total else "No coding submissions recorded for this session."
@@ -1242,8 +1343,26 @@ class InterviewManager:
 
         # Proctoring screenshots / proofs — all plans (appendix size scales with tier)
         tier_ev_cap = {0: 4, 1: 6, 2: 10, 3: 12, 4: 15}
-        max_imgs = tier_ev_cap.get(int(plan_id), 8)
+        max_imgs = tier_ev_cap.get(_normalize_plan_id(plan_id), 8)
         self.collect_evidence()
+        # Include any violation-linked images (paths) not already picked up by directory scan
+        try:
+            seen_paths = {os.path.normpath(p) for p, _ in (self.evidence_images or [])}
+            for v in viol_report:
+                ip = v.get("image_path")
+                if not ip or not isinstance(ip, str):
+                    continue
+                if not os.path.isfile(ip):
+                    continue
+                npth = os.path.normpath(ip)
+                if npth in seen_paths:
+                    continue
+                seen_paths.add(npth)
+                lab = str(v.get("type") or "Incident").replace("_", " ")
+                self.evidence_images.append((npth, lab))
+        except Exception as _evmerge:
+            print(f"[PDF] Evidence merge from violations skipped: {_evmerge}")
+
         if self.evidence_images:
             story.append(CondPageBreak(3.4 * inch))
             story.append(
@@ -1350,28 +1469,87 @@ class InterviewManager:
             return []
 
     def cleanup_session(self):
-        """Removes sensitive files (resume, proctoring images) from the server to save space and ensure privacy."""
-        # 1. Delete Candidate Resume
-        if hasattr(self, 'resume_path') and self.resume_path and os.path.exists(self.resume_path):
+        """Remove resume, per-violation captures, and session proof images after PDF/DB retention (frees disk)."""
+        import shutil
+
+        backend_dir = os.path.abspath(os.path.dirname(__file__))
+        resumes_root = os.path.abspath(os.path.join(backend_dir, "resumes"))
+        cwd = os.path.abspath(os.getcwd())
+        evidence_root = os.path.abspath(os.path.join(cwd, "evidence"))
+
+        def _allowed_roots():
+            roots = [resumes_root]
+            if os.path.isdir(evidence_root):
+                roots.append(evidence_root)
+            return roots
+
+        def _safe_unlink_file(p: str) -> bool:
             try:
-                # Close any potential hooks if any library was holding it (unlikely but safe)
-                os.remove(self.resume_path)
-                print(f"🗑️ [CLEANUP] Deleted resume: {os.path.basename(self.resume_path)}")
-                self.resume_path = None
+                if not p or not isinstance(p, str) or not os.path.isfile(p):
+                    return False
+                ap = os.path.abspath(p)
+                for r in _allowed_roots():
+                    if ap == r or ap.startswith(r + os.sep):
+                        os.remove(ap)
+                        print(f"🗑️ [CLEANUP] Deleted file: {os.path.basename(ap)}")
+                        return True
+                print(f"⚠️ [CLEANUP] Skipped delete (outside resumes/evidence): {ap}")
+                return False
             except Exception as e:
-                print(f"⚠️ [CLEANUP] Could not delete resume: {e}")
-        
-        # 2. Delete Procting Evidence Folder
-        if hasattr(self, 'evidence_path') and self.evidence_path and os.path.exists(self.evidence_path):
+                print(f"⚠️ [CLEANUP] Could not delete file {p}: {e}")
+                return False
+
+        # 0. Images referenced by the violation log (proctor + client events with captures)
+        try:
+            for v in list(getattr(self, "violations", None) or []):
+                if not isinstance(v, dict):
+                    continue
+                ip = v.get("image_path")
+                if ip and _safe_unlink_file(str(ip)):
+                    v["image_path"] = None
+        except Exception as e:
+            print(f"⚠️ [CLEANUP] violation image sweep: {e}")
+
+        # 1. Uploaded resume PDF (session already extracted text / stored in DB)
+        rp = getattr(self, "resume_path", None)
+        if rp and os.path.isfile(rp):
+            _safe_unlink_file(rp)
+        self.resume_path = None
+
+        # 2. Flat evidence/: proof_<session_id>_*.jpg written by ProctoringService.save_evidence
+        sid = str(getattr(self, "session_id", "") or "")
+        if sid and os.path.isdir(evidence_root):
+            pfx = f"proof_{sid}_"
             try:
-                import shutil
-                shutil.rmtree(self.evidence_path)
-                print(f"🗑️ [CLEANUP] Deleted evidence folder: {self.evidence_path}")
-                self.evidence_path = None
+                for fn in os.listdir(evidence_root):
+                    if not fn.startswith(pfx):
+                        continue
+                    if not fn.lower().endswith((".jpg", ".jpeg", ".png")):
+                        continue
+                    full = os.path.join(evidence_root, fn)
+                    _safe_unlink_file(full)
             except Exception as e:
-                print(f"⚠️ [CLEANUP] Could not delete evidence: {e}")
-        
-        # 3. Clear transient image data
+                print(f"⚠️ [CLEANUP] session proof sweep: {e}")
+
+        # 3. Optional dedicated evidence_path (subdir or single file). Never delete the shared top-level evidence/ root.
+        ep = getattr(self, "evidence_path", None)
+        if ep and os.path.exists(ep):
+            ep_abs = os.path.abspath(ep)
+            try:
+                if os.path.isfile(ep_abs):
+                    _safe_unlink_file(ep_abs)
+                elif os.path.isdir(ep_abs):
+                    if ep_abs == evidence_root:
+                        pass
+                    elif ep_abs.startswith(evidence_root + os.sep) or ep_abs.startswith(resumes_root + os.sep):
+                        shutil.rmtree(ep_abs, ignore_errors=True)
+                        print(f"🗑️ [CLEANUP] Removed evidence directory tree: {ep_abs}")
+                    else:
+                        print(f"⚠️ [CLEANUP] Skipped rmtree (unexpected location): {ep_abs}")
+            except Exception as e:
+                print(f"⚠️ [CLEANUP] evidence_path cleanup: {e}")
+            self.evidence_path = None
+
         self.evidence_images = []
         self.candidate_photo = None
     def analyze_coding_submission(self, submission):
@@ -1450,10 +1628,10 @@ class InterviewManager:
         if not self.resume_text or not self.client:
             # Category-aware fallback even in offline mode
             fallbacks = {
-                'greeting': [f"Hello {self.candidate_name}. Welcome to your interview! How are you doing today?"],
+                'greeting': [f"Hello {self.candidate_name}. Welcome to your interview! Whenever you are ready, we'll begin with a short warm-up."],
                 'warmup': [
                     "Great to have you here. Did you face any issues while reaching or connecting today?",
-                    "How has your day been treating you so far?"
+                    "Is there anything you need before we move into deeper questions?",
                 ],
                 'intro': ["To get us started, could you please provide a brief introduction about yourself and your background?"],
                 'resume_overview': ["From what you wrote on your resume, how do your strongest project and your top skill reinforce each other for the role you want?"],
@@ -1515,16 +1693,16 @@ class InterviewManager:
             nm = candidate_name_copy or self.candidate_name or "the candidate"
             context_instruction = (
                 f"Greet {nm} professionally using a time-appropriate opener (good morning, good afternoon, or good evening). "
-                f"Then ask exactly ONE short welcoming question—such as how they are doing today or if they feel ready to begin. "
-                f"Keep the whole utterance brief and natural."
+                f"Ask only whether they are ready to begin—do not ask how their day was or other small-talk "
+                f"(the warm-up step handles rapport). Keep the whole utterance brief and natural."
             )
             self.current_topic = "Greeting"
         elif category == 'warmup':
             context = "Step 2: Basic warm-up (human rapport)"
             warmup_options = [
-                "How has your day been so far?",
                 "Did everything go smoothly getting set up for this session?",
-                "Is there anything you need before we move into deeper questions?"
+                "Is there anything you need before we move into deeper questions?",
+                "How are you feeling about starting this interview?",
             ]
             remaining = [o for o in warmup_options if o not in previous_questions]
             topic_to_ask = remaining[0] if remaining else random.choice(warmup_options)
@@ -1987,54 +2165,78 @@ class InterviewManager:
             
             if img is None:
                 print("❌ [FACE] Failed to decode profile image data.")
+                self.profile_identity_bgr = None
+                self.profile_face_hist = None
+                self.profile_eye_hist = None
                 return None
             
-            # Extract Histogram with Profile settings (Aggressive detection)
-            hist = self._get_face_histogram(img, is_profile=True)
-            if hist is not None:
-                self.profile_face_hist = hist
-                print("✅ [FACE] Profile identity baseline established (Lightweight).")
+            self.profile_identity_bgr = img.copy()
+            try:
+                import identity_compare as ic
+
+                pf, pe = ic.extract_face_and_periocular_histograms(img, is_profile=True)
+                if pf is None:
+                    self.profile_face_hist = None
+                    self.profile_eye_hist = None
+                    self.profile_identity_bgr = None
+                    print("❌ [FACE] No face found in candidate's profile photo.")
+                    return None
+                self.profile_face_hist = pf
+                self.profile_eye_hist = pe
+                print("✅ [FACE] Profile identity baseline established (face + periocular).")
                 return True
-            
-            print("❌ [FACE] No face found in candidate's profile photo.")
-            return None
+            except Exception as ic_err:
+                print(f"❌ [FACE] identity_compare error: {ic_err}")
+                self.profile_identity_bgr = None
+                self.profile_face_hist = None
+                self.profile_eye_hist = None
+                return None
         except Exception as e:
             print(f"❌ [FACE] Profile prep error: {e}")
             return None
 
     def verify_face_match(self, frame):
         """
-        Compare live camera face to the profile-photo histogram (HISTCMP_CORREL).
-        Higher = more similar. Reject low scores so a different person cannot pass as the account holder.
-        Override strictness with env FACE_MATCH_MIN_CORREL (default 0.58).
+        Compare live camera to stored profile (face + periocular) via identity_compare when available.
         """
-        if self.profile_face_hist is None:
-            return False, "Profile image missing"
-
         if frame is None:
             return False, "Live camera feed lost"
 
-        try:
-            import cv2
-            import numpy as np
+        if getattr(self, "profile_identity_bgr", None) is not None:
+            try:
+                import identity_compare as ic
 
-            # 1. Extract histogram from live frame
+                ok, msg, fc, ee, comb, _code = ic.compare_histogram_identity(
+                    self.profile_identity_bgr, frame, mode="continuous"
+                )
+                if ok:
+                    log.info(
+                        "[FACE] Identity verified (face=%s eye=%s combined=%s)",
+                        f"{fc:.3f}" if fc is not None else "n/a",
+                        f"{ee:.3f}" if ee is not None else "n/a",
+                        f"{comb:.3f}" if comb is not None else "n/a",
+                    )
+                    return True, msg
+                log.warning("[FACE] Identity mismatch: %s", msg)
+                return False, msg
+            except Exception as e:
+                return False, f"Verification error: {str(e)}"
+
+        if self.profile_face_hist is None:
+            return False, "Profile image missing"
+
+        try:
             live_hist = self._get_face_histogram(frame)
-            
             if live_hist is None:
                 print("❌ [FACE] Identity Verification Failed: No face detected in camera.")
                 return False, "Face not detected in camera"
-                
-            # 2. Histogram correlation: 1.0 ~ same lighting/shape distribution; <<0.5 different person/lighting
             similarity = cv2.compareHist(self.profile_face_hist, live_hist, cv2.HISTCMP_CORREL)
             min_correl = float(os.environ.get("FACE_MATCH_MIN_CORREL", "0.58"))
-
             if similarity >= min_correl:
                 print(f"✅ [FACE] Identity verified vs profile (score={similarity:.4f}, min={min_correl})")
                 return True, "Match success"
             print(f"❌ [FACE] Identity mismatch (score={similarity:.4f} < {min_correl})")
             return False, f"Face does not match your profile photo (similarity {similarity:.2f}). Use the same person as on your account, with clear lighting."
-                
         except Exception as e:
             print(f"❌ [FACE] Verification runtime error: {e}")
             return False, f"Verification error: {str(e)}"

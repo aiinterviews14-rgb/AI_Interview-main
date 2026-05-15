@@ -52,25 +52,7 @@ function InnerInstructions() {
         try { window.speechSynthesis.cancel(); } catch (e) { }
 
         setIsSpeaking(true);
-        const playFallback = async () => {
-            if (myId !== globalSpeechTokenRef.current) return;
-            try {
-                const response = await fetch("/api/tts", {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ text }),
-                });
-                if (!response.ok) throw new Error();
-                const blob = await response.blob();
-                const audioUrl = URL.createObjectURL(blob);
-                if (myId !== globalSpeechTokenRef.current) return;
-                const audio = new Audio(audioUrl);
-                audioRef.current = audio;
-                audio.onended = () => setIsSpeaking(false);
-                audio.onerror = () => browserFallback();
-                await audio.play();
-            } catch (err) { browserFallback(); }
-        };
+        let browserFallbackUsed = false;
         const browserFallback = () => {
             try {
                 const utt = new SpeechSynthesisUtterance(text);
@@ -86,6 +68,30 @@ function InnerInstructions() {
                 utt.onend = () => setIsSpeaking(false);
                 window.speechSynthesis.speak(utt);
             } catch (e) { setIsSpeaking(false); }
+        };
+        const runBrowserFallbackOnce = () => {
+            if (browserFallbackUsed) return;
+            browserFallbackUsed = true;
+            browserFallback();
+        };
+        const playFallback = async () => {
+            if (myId !== globalSpeechTokenRef.current) return;
+            try {
+                const response = await fetch("/api/tts", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ text }),
+                });
+                if (!response.ok) throw new Error();
+                const blob = await response.blob();
+                const audioUrl = URL.createObjectURL(blob);
+                if (myId !== globalSpeechTokenRef.current) return;
+                const audio = new Audio(audioUrl);
+                audioRef.current = audio;
+                audio.onended = () => setIsSpeaking(false);
+                audio.onerror = () => runBrowserFallbackOnce();
+                await audio.play();
+            } catch (err) { runBrowserFallbackOnce(); }
         };
         playFallback();
     };

@@ -7,6 +7,8 @@ import { useAuth } from '../auth-context';
 import { useTheme } from '../theme-context';
 import Link from 'next/link';
 
+const LOGIN_WELCOME_VOICE_KEY = 'ai_interview_login_welcome_voice';
+
 export default function Login() {
     const router = useRouter();
     const { login } = useAuth();
@@ -38,25 +40,7 @@ export default function Login() {
         try { window.speechSynthesis.cancel(); } catch (e) { }
 
         setIsSpeaking(true);
-        const playFallback = async () => {
-            if (myId !== globalSpeechTokenRef.current) return;
-            try {
-                const response = await fetch("/api/tts", {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ text }),
-                });
-                if (!response.ok) throw new Error();
-                const blob = await response.blob();
-                const audioUrl = URL.createObjectURL(blob);
-                if (myId !== globalSpeechTokenRef.current) return;
-                const audio = new Audio(audioUrl);
-                audioRef.current = audio;
-                audio.onended = () => setIsSpeaking(false);
-                audio.onerror = () => browserFallback();
-                await audio.play();
-            } catch (err) { browserFallback(); }
-        };
+        let browserFallbackUsed = false;
         const browserFallback = () => {
             try {
                 const utt = new SpeechSynthesisUtterance(text);
@@ -73,12 +57,48 @@ export default function Login() {
                 window.speechSynthesis.speak(utt);
             } catch (e) { setIsSpeaking(false); }
         };
+        const runBrowserFallbackOnce = () => {
+            if (browserFallbackUsed) return;
+            browserFallbackUsed = true;
+            browserFallback();
+        };
+        const playFallback = async () => {
+            if (myId !== globalSpeechTokenRef.current) return;
+            try {
+                const response = await fetch("/api/tts", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ text }),
+                });
+                if (!response.ok) throw new Error();
+                const blob = await response.blob();
+                const audioUrl = URL.createObjectURL(blob);
+                if (myId !== globalSpeechTokenRef.current) return;
+                const audio = new Audio(audioUrl);
+                audioRef.current = audio;
+                audio.onended = () => setIsSpeaking(false);
+                audio.onerror = () => runBrowserFallbackOnce();
+                await audio.play();
+                audio.onerror = null;
+            } catch (err) { runBrowserFallbackOnce(); }
+        };
         playFallback();
     };
 
     useEffect(() => {
-        // Voice welcome on first meaningful interaction or slight delay
+        if (typeof window === 'undefined') return;
+        try {
+            if (sessionStorage.getItem(LOGIN_WELCOME_VOICE_KEY)) return;
+        } catch {
+            /* private / restricted storage */
+        }
         const timer = setTimeout(() => {
+            try {
+                if (sessionStorage.getItem(LOGIN_WELCOME_VOICE_KEY)) return;
+                sessionStorage.setItem(LOGIN_WELCOME_VOICE_KEY, '1');
+            } catch {
+                /* still speak once if storage fails */
+            }
             speak("Welcome back. Please provide your credentials to access the evaluation portal.");
         }, 1500);
         return () => clearTimeout(timer);
@@ -89,8 +109,12 @@ export default function Login() {
         e.preventDefault();
         setLoading(true);
         setError('');
+        const base =
+            typeof window !== 'undefined'
+                ? process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:5000'
+                : process.env.INTERNAL_BACKEND_URL || 'http://backend:5000';
         try {
-            const res = await fetch(`${typeof window !== 'undefined' ? (process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5000') : (process.env.INTERNAL_BACKEND_URL || 'http://backend:5000')}/api/auth/login`, {
+            const res = await fetch(`${base}/api/auth/login`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(formData)
@@ -114,7 +138,9 @@ export default function Login() {
                 speak(msg);
             }
         } catch (err) {
-            setError("Connection to interview node failed.");
+            setError(
+                `Could not reach the API at ${base}. Start the backend (e.g. python api.py) or set NEXT_PUBLIC_API_URL.`
+            );
         } finally {
             setLoading(false);
         }
@@ -176,6 +202,10 @@ export default function Login() {
                 <div className={`flex-1 flex flex-col p-8 lg:p-12 relative overflow-hidden ${theme === 'dark' ? 'bg-[#141B26]' : 'bg-white'}`}>
 
                     <div className="flex-1 flex flex-col justify-center animate-fadeIn">
+                        <div className="mb-6 flex items-center justify-center lg:justify-start gap-2">
+                            <div className="w-9 h-9 rounded-lg bg-blue-600 flex items-center justify-center text-white font-black text-xs shadow-md shadow-blue-500/25">Tv</div>
+                            <span className={`font-black text-lg tracking-tight ${theme === 'dark' ? 'text-white' : 'text-slate-900'}`}>Triveda.ai</span>
+                        </div>
                         <div className="mb-8 text-center lg:text-left">
                             <h1 className={`text-3xl font-black ${theme === 'dark' ? 'text-white' : 'text-[#0F172A]'} mb-1.5 tracking-tighter`}>
                                 Candidate Access

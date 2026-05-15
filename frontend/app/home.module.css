@@ -1,22 +1,3 @@
-/* NEXT-GEN AI PLATFORM THEME - LIGHT MODE RESTORED */
-@import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&display=swap');
-
-:root {
-    --primary: #2563eb;                     /* Professional Blue */
-    --primary-dark: #1e3a8a;                /* Deep Navy */
-    --secondary: #64748b;
-    --accent: #dbeafe;                      /* Very light blue */
-    --background: #f8faff;                  /* Same as global.css */
-    --foreground: #0f172a;
-    --card-bg: #ffffff;
-    --glass-border: rgba(37, 99, 235, 0.1);
-    --text-main: #1e293b;
-    --text-muted: #64748b;
-    --border: #e2e8f0;
-    --success: #10b981;
-    --danger: #ef4444;
-}
-
 .container {
     min-height: 100vh;
     background-color: var(--background);

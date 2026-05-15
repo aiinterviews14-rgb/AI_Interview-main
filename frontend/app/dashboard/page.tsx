@@ -9,6 +9,66 @@ import { useRef } from 'react';
 import Link from 'next/link';
 import { useTheme } from '../theme-context';
 
+type ProfileFormState = {
+    name: string;
+    email: string;
+    phone: string;
+    college_name: string;
+    branch: string;
+    domain: string;
+    year: string;
+    photo: string;
+    resume: string;
+};
+
+/** Shrink profile images so API + localStorage stay under typical limits. */
+async function compressProfilePhotoDataUrl(dataUrl: string, maxEdge = 480, quality = 0.72): Promise<string> {
+    if (!dataUrl?.startsWith('data:image')) return dataUrl;
+    return new Promise((resolve) => {
+        const img = new Image();
+        img.onload = () => {
+            let { width, height } = img;
+            const scale = Math.min(1, maxEdge / Math.max(width, height, 1));
+            const w = Math.round(width * scale);
+            const h = Math.round(height * scale);
+            const canvas = document.createElement('canvas');
+            canvas.width = w;
+            canvas.height = h;
+            const ctx = canvas.getContext('2d');
+            if (!ctx) {
+                resolve(dataUrl);
+                return;
+            }
+            ctx.drawImage(img, 0, 0, w, h);
+            resolve(canvas.toDataURL('image/jpeg', quality));
+        };
+        img.onerror = () => resolve(dataUrl);
+        img.src = dataUrl;
+    });
+}
+
+function buildProfileUpdateBody(
+    userId: number | undefined,
+    profile: ProfileFormState,
+    options?: { includeResume?: boolean }
+): Record<string, unknown> {
+    const body: Record<string, unknown> = {
+        id: userId,
+        name: profile.name,
+        email: profile.email,
+        phone: profile.phone,
+        college_name: profile.college_name,
+        year: profile.year,
+        branch: profile.branch,
+        domain: profile.domain,
+    };
+    if (profile.photo?.trim()) body.photo = profile.photo;
+    if (options?.includeResume && profile.resume && profile.resume.length > 200) {
+        body.resume = profile.resume;
+    }
+    return body;
+}
+
 export default function Dashboard() {
     const enterFullScreen = () => {
         if (typeof document !== 'undefined') {
@@ -18,6 +78,8 @@ export default function Dashboard() {
     const { user, logout, updateUser, loading: authLoading } = useAuth();
     const { theme, toggleTheme } = useTheme();
     const router = useRouter();
+    const userRef = useRef(user);
+    userRef.current = user;
     const [interviews, setInterviews] = useState<any[]>([]);
     const [isLoadingData, setIsLoadingData] = useState(true);
     const [filter, setFilter] = useState('All');
@@ -84,7 +146,7 @@ export default function Dashboard() {
             branch: user.branch ?? '',
             domain: user.domain ?? '',
             year: yearVal,
-            photo: user.photo ?? prev.photo,
+            photo: user.photo?.trim() ? user.photo : prev.photo,
             resume: prev.resume,
         }));
     }, [user?.id, user?.name, user?.email, user?.phone, user?.college_name, user?.year, user?.branch, user?.domain, user?.photo]);
@@ -107,6 +169,35 @@ export default function Dashboard() {
         window.addEventListener('focus', handleFocus);
         return () => window.removeEventListener('focus', handleFocus);
     }, [user?.id, authLoading]); // Use user.id to prevent infinite loop
+
+    /** After strict identity failure on interview — open profile editor on dashboard. */
+    useEffect(() => {
+        if (typeof window === 'undefined' || !user?.id) return;
+        const url = new URL(window.location.href);
+        let changed = false;
+        if (url.searchParams.get('identity_mismatch') === '1') {
+            setMessage(
+                'IDENTITY MISMATCH: Your live photo did not match your profile. Update your profile photo below to the same person who will take the interview, click Save, then return here and start the interview again.'
+            );
+            setIsProfileModalOpen(true);
+            setActiveTab('Dashboard');
+            url.searchParams.delete('identity_mismatch');
+            changed = true;
+        }
+        if (url.searchParams.get('name_mismatch') === '1') {
+            setMessage(
+                'NAME MISMATCH: Your account or resume name does not match this session. Correct your name in Edit Profile (and re-upload your resume if needed), save, then start the interview again.'
+            );
+            setIsProfileModalOpen(true);
+            setActiveTab('Dashboard');
+            url.searchParams.delete('name_mismatch');
+            changed = true;
+        }
+        if (changed) {
+            const q = url.searchParams.toString();
+            window.history.replaceState({}, '', `${url.pathname}${q ? `?${q}` : ''}`);
+        }
+    }, [user?.id]);
 
     const fetchUserResumes = async () => {
         if (!user?.id) return;
@@ -275,14 +366,27 @@ export default function Dashboard() {
     };
 
     const fetchInterviews = async () => {
-        if (!user?.id) return;
+        const u = userRef.current;
+        if (!u?.id) return;
         setIsLoadingData(true);
         try {
-            const res = await fetch(`${typeof window !== 'undefined' ? (process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5000') : (process.env.INTERNAL_BACKEND_URL || 'http://backend:5000')}/api/user/dashboard/${user.id}`);
+            const res = await fetch(`${typeof window !== 'undefined' ? (process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5000') : (process.env.INTERNAL_BACKEND_URL || 'http://backend:5000')}/api/user/dashboard/${u.id}`);
             const data = await res.json();
             if (data.status === 'success') {
                 setInterviews(data.interviews);
-                if (data.user) updateUser(data.user);
+                // Merge only fields this endpoint is authoritative for. Replacing the whole
+                // `user` races in-flight requests and can wipe a just-saved profile/photo.
+                if (data.user) {
+                    const latest = userRef.current;
+                    if (!latest) return;
+                    updateUser({
+                        ...latest,
+                        plan_id: data.user.plan_id ?? latest.plan_id,
+                        interviews_remaining: data.user.interviews_remaining ?? latest.interviews_remaining,
+                        resume_score: data.user.resume_score ?? latest.resume_score,
+                        resume_path: data.user.resume_path ?? latest.resume_path,
+                    });
+                }
             }
         } catch (e) {
             console.warn(e);
@@ -808,14 +912,34 @@ export default function Dashboard() {
         e.preventDefault();
         setSaving(true);
         try {
+            let photoOut = profileData.photo;
+            if (photoOut?.startsWith('data:image')) {
+                photoOut = await compressProfilePhotoDataUrl(photoOut);
+            }
+            const profilePayload: ProfileFormState = { ...profileData, photo: photoOut };
+            const body = buildProfileUpdateBody(user?.id, profilePayload, {
+                includeResume: Boolean(profileData.resume && profileData.resume.length > 200),
+            });
             const res = await fetch(`${typeof window !== 'undefined' ? (process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5000') : (process.env.INTERNAL_BACKEND_URL || 'http://backend:5000')}/api/user/profile/update`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ id: user?.id, ...profileData })
+                body: JSON.stringify(body)
             });
             const data = await res.json();
             if (data.status === 'success') {
+                const saved = data.user as Record<string, unknown>;
                 updateUser(data.user);
+                setProfileData((prev) => ({
+                    name: String(saved.name ?? ''),
+                    email: String(saved.email ?? ''),
+                    phone: String(saved.phone ?? ''),
+                    college_name: String(saved.college_name ?? ''),
+                    branch: String(saved.branch ?? ''),
+                    domain: String(saved.domain ?? ''),
+                    year: saved.year && saved.year !== 'N/A' ? String(saved.year) : '',
+                    photo: typeof saved.photo === 'string' && saved.photo.trim() ? saved.photo : prev.photo,
+                    resume: '',
+                }));
                 setMessage('✅ Profile updated successfully!');
                 setTimeout(() => setIsProfileModalOpen(false), 1500);
             } else setMessage('❌ ' + (data.message || 'Error'));
@@ -907,7 +1031,27 @@ export default function Dashboard() {
         if (ctx) {
             ctx.drawImage(videoRef.current, 0, 0, 400, 400);
             const photoData = canvas.toDataURL('image/jpeg', 0.7);
-            setProfileData({ ...profileData, photo: photoData });
+            void (async () => {
+                const small = await compressProfilePhotoDataUrl(photoData);
+                setProfileData((prev) => {
+                    const merged = { ...prev, photo: small };
+                    queueMicrotask(async () => {
+                        try {
+                            const body = buildProfileUpdateBody(user?.id, merged, { includeResume: false });
+                            const res = await fetch(`${typeof window !== 'undefined' ? (process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5000') : (process.env.INTERNAL_BACKEND_URL || 'http://backend:5000')}/api/user/profile/update`, {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify(body)
+                            });
+                            const data = await res.json();
+                            if (data.status === 'success') updateUser(data.user);
+                        } catch (err) {
+                            console.warn('Auto-save capture fail', err);
+                        }
+                    });
+                    return merged;
+                });
+            })();
 
             // Stop hardware
             const stream = (window as any).__cameraStream || (videoRef.current.srcObject as MediaStream);
@@ -923,20 +1067,31 @@ export default function Dashboard() {
         const file = e.target.files?.[0];
         if (file) {
             const reader = new FileReader();
-            reader.onloadend = async () => {
-                const photoSrc = reader.result as string;
-                setProfileData({ ...profileData, photo: photoSrc });
-                
-                // Auto-save photo logic to make it active instantly
-                try {
-                    const res = await fetch(`${typeof window !== 'undefined' ? (process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5000') : (process.env.INTERNAL_BACKEND_URL || 'http://backend:5000')}/api/user/profile/update`, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ id: user?.id, ...profileData, photo: photoSrc })
-                    });
-                    const data = await res.json();
-                    if (data.status === 'success') updateUser(data.user);
-                } catch (err) { console.warn("Auto-save photo fail", err); }
+            reader.onloadend = () => {
+                const raw = reader.result as string;
+                void (async () => {
+                    try {
+                        const small = await compressProfilePhotoDataUrl(raw);
+                        setProfileData((prev) => {
+                            const merged = { ...prev, photo: small };
+                            queueMicrotask(async () => {
+                                try {
+                                    const body = buildProfileUpdateBody(user?.id, merged, { includeResume: false });
+                                    const res = await fetch(`${typeof window !== 'undefined' ? (process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5000') : (process.env.INTERNAL_BACKEND_URL || 'http://backend:5000')}/api/user/profile/update`, {
+                                        method: 'POST',
+                                        headers: { 'Content-Type': 'application/json' },
+                                        body: JSON.stringify(body)
+                                    });
+                                    const data = await res.json();
+                                    if (data.status === 'success') updateUser(data.user);
+                                } catch (err) { console.warn("Auto-save photo fail", err); }
+                            });
+                            return merged;
+                        });
+                    } catch {
+                        console.warn("Photo compress failed");
+                    }
+                })();
             };
             reader.readAsDataURL(file);
         }
@@ -1171,6 +1326,20 @@ export default function Dashboard() {
                         {isProfileOpen && <div className="fixed inset-0 z-40" onClick={() => setIsProfileOpen(false)} />}
                     </div>
                 </header>
+
+                {message && (message.includes('IDENTITY MISMATCH') || message.includes('NAME MISMATCH')) && (
+                    <div className="mx-6 md:mx-8 mt-4 p-4 rounded-2xl border-2 border-red-600 bg-red-50 dark:bg-red-950/50 text-red-900 dark:text-red-100 text-sm font-bold flex items-start gap-3">
+                        <ShieldAlert className="shrink-0 mt-0.5" size={22} />
+                        <p className="flex-1 leading-relaxed">{message}</p>
+                        <button
+                            type="button"
+                            onClick={() => setMessage('')}
+                            className="shrink-0 text-xs font-black uppercase tracking-wider text-red-800 dark:text-red-200 hover:underline"
+                        >
+                            Dismiss
+                        </button>
+                    </div>
+                )}
 
                 <main className="flex-1 p-6 md:p-8 space-y-6 overflow-y-auto w-full max-w-[1500px] mx-auto scroll-smooth">
                     {activeTab === 'Assessments' && (

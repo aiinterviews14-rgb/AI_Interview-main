@@ -167,6 +167,33 @@ export default function Signup() {
 
         setIsSpeaking(true);
 
+        let browserFallbackUsed = false;
+        const browserFallback = () => {
+            try {
+                const utt = new SpeechSynthesisUtterance(text);
+                const voices = window.speechSynthesis.getVoices();
+                // Strictly prioritize Male voices for Atlas
+                const maleVoice = voices.find(v =>
+                    v.name.toLowerCase().includes('david') ||
+                    v.name.toLowerCase().includes('james') ||
+                    v.name.toLowerCase().includes('google us english') ||
+                    (v.name.toLowerCase().includes('male') && !v.name.toLowerCase().includes('female'))
+                );
+                if (maleVoice) utt.voice = maleVoice;
+                utt.rate = 0.9;
+                utt.pitch = 0.85; // Lower pitch for masculine feel
+                utt.onend = () => setIsSpeaking(false);
+                window.speechSynthesis.speak(utt);
+            } catch (e) {
+                setIsSpeaking(false);
+            }
+        };
+        const runBrowserFallbackOnce = () => {
+            if (browserFallbackUsed) return;
+            browserFallbackUsed = true;
+            browserFallback();
+        };
+
         const playFallback = async () => {
             if (myId !== globalSpeechTokenRef.current) return;
 
@@ -196,33 +223,12 @@ export default function Signup() {
 
                 audio.onerror = () => {
                     console.warn("⚠️ Audio playback error, using browser fallback.");
-                    browserFallback();
+                    runBrowserFallbackOnce();
                 };
 
                 await audio.play();
             } catch (err) {
-                browserFallback();
-            }
-        };
-
-        const browserFallback = () => {
-            try {
-                const utt = new SpeechSynthesisUtterance(text);
-                const voices = window.speechSynthesis.getVoices();
-                // Strictly prioritize Male voices for Atlas
-                const maleVoice = voices.find(v =>
-                    v.name.toLowerCase().includes('david') ||
-                    v.name.toLowerCase().includes('james') ||
-                    v.name.toLowerCase().includes('google us english') ||
-                    (v.name.toLowerCase().includes('male') && !v.name.toLowerCase().includes('female'))
-                );
-                if (maleVoice) utt.voice = maleVoice;
-                utt.rate = 0.9;
-                utt.pitch = 0.85; // Lower pitch for masculine feel
-                utt.onend = () => setIsSpeaking(false);
-                window.speechSynthesis.speak(utt);
-            } catch (e) {
-                setIsSpeaking(false);
+                runBrowserFallbackOnce();
             }
         };
 
@@ -241,7 +247,7 @@ export default function Signup() {
         if (hasStarted) {
             scrollToBottom();
 
-            if (!isTyping && !isSubmitting && chatStep !== 9 && chatStep !== 8 && chatStep !== 4) {
+            if (!isTyping && !isSubmitting && chatStep !== 10 && chatStep !== 9 && chatStep !== 8 && chatStep !== 4) {
                 inputRef.current?.focus();
             }
         }
@@ -251,7 +257,7 @@ export default function Signup() {
         let isStopped = false;
 
         const syncCamera = async () => {
-            if (chatStep === 9 && !capturedImage && !streamRef.current) {
+            if (chatStep === 10 && !capturedImage && !streamRef.current) {
                 try {
                     console.log("📸 Requesting camera access...");
                     let stream: MediaStream;
@@ -300,7 +306,7 @@ export default function Signup() {
         syncCamera();
 
         // If camera is active and video element just mounted/updated
-        if (chatStep === 9 && streamRef.current && videoRef.current && !videoRef.current.srcObject) {
+        if (chatStep === 10 && streamRef.current && videoRef.current && !videoRef.current.srcObject) {
             videoRef.current.srcObject = streamRef.current;
             videoRef.current.play().catch(e => {
                 if (e.name !== 'AbortError') console.error("Camera mount play failed:", e);
@@ -358,8 +364,8 @@ export default function Signup() {
         setIsProcessing(true);
 
         // Add User Message
-        // Step 8 is Password
-        const displayedText = chatStep === 8 ? '•'.repeat(inputValue.length) : inputValue;
+        // Step 8 & 9 are Password related
+        const displayedText = (chatStep === 8 || chatStep === 9) ? '•'.repeat(inputValue.length) : inputValue;
         const userMsg: Message = {
             id: Date.now() + Math.random(),
             sender: 'user',
@@ -373,9 +379,11 @@ export default function Signup() {
         processStep(chatStep, inputValue);
     };
 
-    const handleOptionSelect = (val: string) => {
+    const handleOptionSelect = (val: string, expectedStep?: number) => {
         if (isProcessing) return;
         setIsProcessing(true);
+
+        const stepToUse = expectedStep !== undefined ? expectedStep : chatStep;
 
         const userMsg: Message = {
             id: Date.now() + Math.random(),
@@ -386,7 +394,7 @@ export default function Signup() {
         setMessages(prev => [...prev, userMsg]);
         setInputValue('');
         setIsTyping(true);
-        processStep(chatStep, val);
+        processStep(stepToUse, val);
     };
 
     const processStep = async (currentStep: number, value: string) => {
@@ -461,7 +469,7 @@ export default function Signup() {
                             {['B.Tech', 'B.Pharmacy', 'Agriculture', 'Degree', 'MBA/PG', 'Others'].map(opt => (
                                 <button 
                                     key={opt}
-                                    onClick={() => handleOptionSelect(opt)}
+                                    onClick={() => handleOptionSelect(opt, 4)}
                                     className="px-4 py-2 bg-white text-blue-600 border border-blue-200 rounded-lg hover:bg-blue-50 text-xs font-bold transition-all"
                                 >
                                     {opt}
@@ -481,12 +489,13 @@ export default function Signup() {
             case 5: // Branch Input
                 currentData.branch = value;
                 setUserData(prev => ({ ...prev, branch: value }));
-                responseText = "For the stats, which year are you in? (e.g. 2nd Year, 3rd Year, 4th Year)";
+                responseText = "For the stats, which year are you in? (e.g. 1st Year, 2nd Year, 3rd Year, 4th Year)";
                 break;
 
             case 6: // Year Input
                 let yearVal = value.trim();
-                if (['2', '2nd', 'second', 'ii'].some(x => yearVal.toLowerCase().includes(x))) yearVal = "2nd Year";
+                if (['1', '1st', 'first', 'i'].some(x => yearVal.toLowerCase().includes(x))) yearVal = "1st Year";
+                else if (['2', '2nd', 'second', 'ii'].some(x => yearVal.toLowerCase().includes(x))) yearVal = "2nd Year";
                 else if (['3', '3rd', 'third', 'iii'].some(x => yearVal.toLowerCase().includes(x))) yearVal = "3rd Year";
                 else if (['4', '4th', 'fourth', 'iv'].some(x => yearVal.toLowerCase().includes(x))) yearVal = "4th Year";
                 currentData.year = yearVal;
@@ -515,14 +524,27 @@ export default function Signup() {
                 }
                 currentData.password = value;
                 setUserData(prev => ({ ...prev, password: value }));
+                responseText = "Please confirm your password.";
+                break;
+
+            case 9: // Confirm Password
+                if (value !== userData.password) {
+                    setIsTyping(false);
+                    setIsProcessing(false);
+                    setMessages(prev => [...prev, { id: Date.now() + Math.random(), sender: 'bot', text: "Passwords do not match. Please try again.", time: getCurrentTime() }]);
+                    return;
+                }
                 responseText = "Password secure! 🔒 Now, strictly for proctoring verification, I need to capture a live photo of you. This will be used to verify your identity during the interview.";
+                break;
+
+            case 10: // Camera Step Placeholder (Logic handled elsewhere)
                 break;
 
             default:
                 break;
         }
 
-        if (currentStep !== 9) {
+        if (currentStep < 10) {
             // Normal flow (Skip for camera step, handled separately)
             setTimeout(() => {
                 setMessages(prev => [...prev, { id: Date.now() + Math.random(), sender: 'bot', text: responseText, time: getCurrentTime() }]);
@@ -590,7 +612,7 @@ export default function Signup() {
         setMessages(prev => [...prev, { id: Date.now() + Math.random(), sender: 'user', text: "Photo captured.", time: getCurrentTime() }]);
         setMessages(prev => [...prev, { id: Date.now() + Math.random(), sender: 'bot', text: "Photo verified. Creating your secure account... 🛠️", time: getCurrentTime() }]);
         setIsTyping(true);
-        setChatStep(10); // Moving to processing step
+        setChatStep(11); // Moving to processing step
 
         // Capture data at this moment to avoid closure stale state
         const submissionData = { ...userData, photo: capturedImage };
@@ -612,7 +634,12 @@ export default function Signup() {
                         time: getCurrentTime()
                     }]);
                     setIsTyping(false);
-                    setChatStep(11); // Success state
+                    setChatStep(12); // Success state
+                    
+                    // Auto-redirect after 3 seconds
+                    setTimeout(() => {
+                        router.push('/login');
+                    }, 3000);
                 } else if (data.message && (data.message.toLowerCase().includes("exist") || data.message.toLowerCase().includes("already"))) {
                     setIsTyping(false);
                     setMessages(prev => [...prev, {
@@ -663,20 +690,20 @@ export default function Signup() {
     const getInputType = () => {
         if (chatStep === 2) return "email";
         if (chatStep === 3) return "tel";
-        if (chatStep === 8) return showPassword ? "text" : "password";
+        if (chatStep === 8 || chatStep === 9) return showPassword ? "text" : "password";
         return "text";
     };
 
     const getPlaceholder = () => {
         if (chatStep === 1) return "Type your full name...";
-        if (chatStep === 2) return "name@university.edu";
-        if (chatStep === 3) return "e.g. 9876543210";
+        if (chatStep === 2) return "name@example.com";
+        if (chatStep === 3) return "10-digit mobile number...";
         if (chatStep === 4) return "Select or type educational domain...";
-        if (chatStep === 5) return "e.g. CSE, ECE, AI/ML...";
-        if (chatStep === 6) return "e.g. 3rd Year, 4th Year...";
-        if (chatStep === 7) return "e.g. Vignan University";
+        if (chatStep === 5) return "Your branch (e.g. CSE, ECE)...";
+        if (chatStep === 7) return "College or University name...";
         if (chatStep === 8) return "Create a secure password...";
-        return "Type your answer...";
+        if (chatStep === 9) return "Confirm your password...";
+        return "Type your response...";
     };
 
     // --- KEYBOARD SHORTCUTS ---
@@ -686,10 +713,10 @@ export default function Signup() {
                 if (!hasStarted) {
                     e.preventDefault();
                     startChat();
-                } else if (chatStep === 7 && capturedImage) {
+                } else if (chatStep === 10 && capturedImage) {
                     e.preventDefault();
                     confirmPhoto();
-                } else if (chatStep === 9) {
+                } else if (chatStep === 12) {
                     e.preventDefault();
                     router.push('/login');
                 }
@@ -869,7 +896,7 @@ export default function Signup() {
                         Progress
                     </div>
                     <div className="w-full h-1 bg-slate-800 rounded-full overflow-hidden">
-                        <div className="h-full bg-blue-500 transition-all duration-700 ease-out" style={{ width: `${Math.min((chatStep / 8) * 100, 100)}%` }}></div>
+                        <div className="h-full bg-blue-500 transition-all duration-700 ease-out" style={{ width: `${Math.min((chatStep / 9) * 100, 100)}%` }}></div>
                     </div>
                 </div>
             </div>
@@ -889,7 +916,7 @@ export default function Signup() {
                             {theme === 'dark' ? <Sun size={18} /> : <Moon size={18} />}
                         </button>
                         <div className="text-xs font-medium text-blue-600 bg-blue-500/10 px-3 py-1 rounded-full">
-                            Step {Math.min(chatStep, 8)} of 8
+                            Step {Math.min(chatStep, 9)} of 9
                         </div>
                     </div>
                 </div>
@@ -924,7 +951,7 @@ export default function Signup() {
                         {isTyping && <TypingIndicator />}
 
                         {/* Success State */}
-                        {!isTyping && chatStep === 11 && (
+                        {!isTyping && chatStep === 12 && (
                             <div className="flex justify-center mt-8 animate-pulse">
                                 <div className="bg-green-50 text-green-700 px-6 py-3 rounded-full flex items-center gap-2 text-sm font-medium border border-green-100">
                                     <ShieldCheck size={18} />
@@ -937,7 +964,7 @@ export default function Signup() {
                         <div ref={messagesEndRef} className="h-4" />
 
                         {/* CAMERA UI OVERLAY */}
-                        {chatStep === 9 && (
+                        {chatStep === 10 && (
                             <div className="my-6 bg-[var(--card-bg)] border border-dashed border-blue-300 p-6 rounded-3xl animate-fadeIn flex flex-col items-center gap-4">
                                 {!cameraActive && !capturedImage && (
                                     <button onClick={startCamera} className="px-6 py-3 bg-blue-600 text-white rounded-xl shadow-lg hover:bg-blue-700 flex items-center gap-2">
@@ -980,7 +1007,7 @@ export default function Signup() {
                 {/* Input Area */}
                 <div className="absolute bottom-0 left-0 right-0 bg-[var(--nav-bg)]/95 backdrop-blur-sm p-4 md:p-6 border-t border-[var(--border)] z-20">
                     <div className="max-w-3xl mx-auto">
-                        {chatStep === 11 ? (
+                        {chatStep === 12 ? (
                             <button
                                 onClick={() => router.push('/login')}
                                 className="w-full bg-blue-600 hover:bg-blue-700 text-white font-semibold py-4 rounded-xl shadow-lg shadow-blue-200 transition-all flex items-center justify-center gap-2"
@@ -993,12 +1020,12 @@ export default function Signup() {
                                 className={`relative transition-all duration-300 ${isTyping ? 'opacity-50' : 'opacity-100'}`}
                             >
                                 {chatStep === 6 ? (
-                                    <div className="grid grid-cols-3 gap-3">
-                                        {['2nd Year', '3rd Year', '4th Year'].map((y) => (
+                                    <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                                        {['1st Year', '2nd Year', '3rd Year', '4th Year'].map((y) => (
                                             <button
                                                 key={y}
                                                 type="button"
-                                                onClick={() => handleOptionSelect(y)}
+                                                onClick={() => handleOptionSelect(y, 6)}
                                                 className="bg-[var(--card-bg)] border border-[var(--border)] hover:border-blue-500 hover:bg-blue-500/10 text-[var(--foreground)] font-bold py-4 rounded-2xl transition-all shadow-sm active:scale-95"
                                             >
                                                 {y}
@@ -1014,12 +1041,12 @@ export default function Signup() {
                                                 value={inputValue}
                                                 onChange={(e) => setInputValue(e.target.value)}
                                                 placeholder={getPlaceholder()}
-                                                disabled={isTyping || chatStep > 8}
-                                                autoComplete={chatStep === 8 ? "new-password" : "off"}
-                                                className={`w-full bg-[var(--card-bg)] border border-[var(--border)] text-[var(--foreground)] placeholder-[var(--text-muted)] text-lg px-6 py-4 rounded-2xl focus:ring-2 focus:ring-blue-500 focus:bg-[var(--background)] transition-all shadow-inner relative z-10 ${chatStep === 8 ? 'pr-14' : ''}`}
+                                                disabled={isTyping || chatStep > 9}
+                                                autoComplete={chatStep === 8 || chatStep === 9 ? "new-password" : "off"}
+                                                className={`w-full bg-[var(--card-bg)] border border-[var(--border)] text-[var(--foreground)] placeholder-[var(--text-muted)] text-lg px-6 py-4 rounded-2xl focus:ring-2 focus:ring-blue-500 focus:bg-[var(--background)] transition-all shadow-inner relative z-10 ${chatStep === 8 || chatStep === 9 ? 'pr-14' : ''}`}
                                                 autoFocus
                                             />
-                                            {chatStep === 8 && (
+                                            {chatStep === 8 || chatStep === 9 ? (
                                                 <button
                                                     type="button"
                                                     onClick={() => setShowPassword(!showPassword)}
@@ -1027,11 +1054,11 @@ export default function Signup() {
                                                 >
                                                     {showPassword ? <EyeOff size={20} /> : <Eye size={20} />}
                                                 </button>
-                                            )}
+                                            ) : null}
                                         </div>
                                         <button
                                             type="submit"
-                                            disabled={!inputValue.trim() || isTyping || chatStep > 8}
+                                            disabled={!inputValue.trim() || isTyping || chatStep > 9}
                                             className={`
                         p-3 rounded-xl transition-all duration-200
                         ${!inputValue.trim() ? 'bg-slate-200 text-slate-400 cursor-not-allowed' : 'bg-blue-600 text-white hover:bg-blue-700 shadow-md transform hover:scale-105'}

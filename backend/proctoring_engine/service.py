@@ -12,20 +12,9 @@ from groq import Groq
 has_face_rec = False
 has_deepface = False
 
-# Try importing YOLO, handle if missing
-try:
-    from ultralytics import YOLO
-    has_yolo = True
-except ImportError:
-    has_yolo = False
-
+# ML libraries will be imported lazily to prevent startup hangs
+has_yolo = False
 has_mediapipe = False
-try:
-    import mediapipe as mp
-    from mediapipe.solutions import face_mesh
-    has_mediapipe = True
-except (ImportError, AttributeError, ModuleNotFoundError):
-    has_mediapipe = False
 
 class ProctoringService:
     def __init__(self):
@@ -57,31 +46,15 @@ class ProctoringService:
         self.active_profile_encoding = None
         self.active_profile_id = None
         
-        # Initializing Engine Components (Silent)
+        # Initializing Engine Components (Lazy Loading)
         self.face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
         self.face_cascade_alt2 = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_alt2.xml')
         
-        # Load YOLO Model (Centralized)
         self.model = None
-        if has_yolo:
-            try:
-                # Look for model in root OR models folder
-                model_paths = ["yolov8n.pt", os.path.join("backend", "models", "yolov8n.pt"), "models/yolov8n.pt"]
-                for p in model_paths:
-                    if os.path.exists(p):
-                        self.model = YOLO(p)
-                        break
-                if not self.model: self.model = YOLO("yolov8n.pt") 
-            except Exception: pass
-
-        # MediaPipe Mesh Initialization
         self.mp_face_mesh = None
         self.face_mesh = None
-        if has_mediapipe:
-            self.mp_face_mesh = face_mesh
-            self.face_mesh = self.mp_face_mesh.FaceMesh(max_num_faces=4, min_detection_confidence=0.15, min_tracking_confidence=0.15, refine_landmarks=True)
-            
-        print(f"✨ Proctoring Engine: READY (Biometrics: {'ON' if (has_deepface or has_face_rec) else 'FALLBACK'}, Object Detection: {'ON' if has_yolo else 'OFF'})")
+        
+        print(f"* Proctoring Engine: INITIALIZED (Lazy Loading Enabled)")
         
         # EYE LANDMARKS INDICES (MediaPipe Face Mesh)
         self.LEFT_EYE = [33, 160, 158, 133, 153, 144] # 33: Inner corner, 133: Outer corner
@@ -94,6 +67,7 @@ class ProctoringService:
         self.consecutive_phone = 0
         self.consecutive_identity_mismatch = 0
         self.consecutive_looking_away = 0
+        self.consecutive_looking_down = 0
         
         # Violation Occurrence Counters (To meet "At least 3 times" requirement)
         self.multi_face_counts = 0
@@ -105,9 +79,50 @@ class ProctoringService:
         self.frame_count = 0
         self.snapshot_interval = 240 # ~2 minutes at 2fps
         
-        print("Proctoring Service Initialized")
+        print("Proctoring Service Context Created")
+
+    def _lazy_load_models(self):
+        """Internal helper to load heavy models only when first frame arrives or monitoring starts."""
+        global has_yolo, has_mediapipe
+        
+        # 1. Load YOLO
+        if self.model is None:
+            try:
+                from ultralytics import YOLO
+                model_paths = ["yolov8n.pt", os.path.join("backend", "models", "yolov8n.pt"), "models/yolov8n.pt"]
+                for p in model_paths:
+                    if os.path.exists(p):
+                        self.model = YOLO(p)
+                        has_yolo = True
+                        break
+                if not self.model: 
+                    self.model = YOLO("yolov8n.pt")
+                    has_yolo = True
+                print("✅ YOLO Model Loaded Successfully")
+            except Exception as e:
+                print(f"⚠️ YOLO Load Failed: {e}")
+                has_yolo = False
+
+        # 2. Load MediaPipe
+        if self.face_mesh is None:
+            try:
+                import mediapipe as mp
+                from mediapipe.solutions import face_mesh
+                self.mp_face_mesh = face_mesh
+                self.face_mesh = self.mp_face_mesh.FaceMesh(
+                    max_num_faces=4, 
+                    min_detection_confidence=0.15, 
+                    min_tracking_confidence=0.15, 
+                    refine_landmarks=True
+                )
+                has_mediapipe = True
+                print("✅ MediaPipe FaceMesh Loaded Successfully")
+            except Exception as e:
+                print(f"⚠️ MediaPipe Load Failed: {e}")
+                has_mediapipe = False
 
     def start(self):
+        self._lazy_load_models()
         self.running = True
         self.violations = []
         self.should_terminate = False
@@ -118,11 +133,15 @@ class ProctoringService:
         self.consecutive_phone = 0
         self.consecutive_identity_mismatch = 0
         self.consecutive_looking_away = 0
+        self.consecutive_looking_down = 0
         self.multi_face_counts = 0
         self.gadget_counts = 0
         self.identity_mismatch_counts = 0
         self.high_conf_matches = 0
         self.initial_nose = None
+        self.no_face_strike_count = 0
+        if hasattr(self, "multi_face_strike_count"):
+            self.multi_face_strike_count = 0
         # Do not clear session_id, it is set per-interview
         print(f"Proctoring Monitoring Started for Session: {self.session_id}")
 
@@ -142,10 +161,14 @@ class ProctoringService:
             if p_boxes:
                 self.active_profile_encoding = face_recognition.face_encodings(p_rgb, p_boxes)[0]
                 self.reference_frame = frame
+                self._identity_compared_once = False
+                self._last_identity_match = False
                 print("✅ Identity Baseline set successfully")
             else:
                 # Fallback: store frame for DeepFace/Vision checks
                 self.reference_frame = frame
+                self._identity_compared_once = False
+                self._last_identity_match = False
                 print("⚠️ No face in baseline frame. Storing for visual fallback.")
         except Exception as e:
             print(f"Error in set_reference_profile: {e}")
@@ -172,19 +195,30 @@ class ProctoringService:
              try:
                  # Save screenshot with context boxes if provided
                  filename = self.save_evidence(frame, event_type, boxes=boxes)
-                 full_path = os.path.join(self.evidence_path, filename)
-                 event["image_path"] = full_path
-                 event["is_proof"] = (severity == "CRITICAL" or severity == "HIGH")
+                 if filename:
+                     full_path = os.path.join(self.evidence_path, filename)
+                     if os.path.isfile(full_path):
+                         event["image_path"] = full_path
+                         event["is_proof"] = (severity == "CRITICAL" or severity == "HIGH")
              except Exception as e:
                  print(f"Warning: Evidence save failed: {e}")
 
         self.violations.append(event)
         print(f"PROCTOR EVENT: {message} ({severity})")
         
+        # Never auto-terminate on CRITICAL without a persisted proof image (fairness + report integrity).
         if severity == "CRITICAL":
-            self.should_terminate = True
-            self.termination_reason = message
-            print(f"TERMINATION TRIGGERED via record_event: {event_type} - {message}")
+            proof = event.get("image_path")
+            if proof and os.path.isfile(proof):
+                self.should_terminate = True
+                self.termination_reason = message
+                print(f"TERMINATION TRIGGERED via record_event: {event_type} - {message}")
+            else:
+                event["severity"] = "HIGH"
+                print(
+                    f"CRITICAL downgraded to HIGH (no evidence file): {event_type} — "
+                    "session continues until proof can be captured."
+                )
 
     def save_evidence(self, frame, reason, boxes=None):
         """Saves a frame with optional bounding box overlays as proof."""
@@ -198,7 +232,9 @@ class ProctoringService:
         # Use session_id in filename for 100% isolation in reports
         filename = f"proof_{self.session_id}_{reason.replace(' ', '_')}_{timestamp}.jpg"
         filepath = os.path.join(self.evidence_path, filename)
-        cv2.imwrite(filepath, proof_frame)
+        if not cv2.imwrite(filepath, proof_frame):
+            print(f"Warning: cv2.imwrite failed for evidence {filepath}")
+            return None
         return filename
 
     def detect_head_silhouette(self, frame):
@@ -278,6 +314,26 @@ class ProctoringService:
             print(f"Eye tracking exception: {e}")
             return False, "Biometric system error during eye verification."
 
+    def _is_head_pitch_down(self, landmarks) -> bool:
+        """
+        Heuristic: head tilted toward desk/phone — chin and nose vertically compressed vs face height.
+        MediaPipe normalized coords (y grows downward).
+        """
+        try:
+            chin = landmarks[152]
+            nose = landmarks[1]
+            brow = landmarks[10]
+            face_len = max(float(chin.y - brow.y), 0.04)
+            chin_nose = float(chin.y - nose.y)
+            if chin_nose / face_len < 0.16:
+                return True
+            eye_mid_y = (float(landmarks[33].y) + float(landmarks[263].y)) / 2.0
+            if float(nose.y) > eye_mid_y + 0.055:
+                return True
+            return False
+        except Exception:
+            return False
+
     def analyze_face_quality(self, frame):
         """
         Analyze image quality: Brightness, Blur, and Centering.
@@ -346,28 +402,24 @@ class ProctoringService:
 
     def compare_profiles(self, profile_frame, live_frame):
         """
-        Lightweight Identity Verification (OpenCV + Histograms).
-        Replaces heavy face_recognition/DeepFace.
+        Profile vs live: shared face + periocular (eye-region) scoring (see identity_compare).
+        Returns (matched, distance, feedback, is_low_light) where distance = 1 - combined_score
+        for compatibility with callers that treat smaller distance as closer match.
         """
         try:
-            # Analyze Quality
             q_results = self.analyze_face_quality(live_frame)
             is_low_light = q_results[2] if len(q_results) > 2 else False
 
-            p_hist = self._extract_face_hist(profile_frame)
-            l_hist = self._extract_face_hist(live_frame)
-            
-            if p_hist is None:
-                return False, 0.0, "Identity Error: Profile photo face not detected.", is_low_light
-            if l_hist is None:
-                return False, 0.0, "Face not detected", is_low_light
-                
-            similarity = cv2.compareHist(p_hist, l_hist, cv2.HISTCMP_CORREL)
-            
-            # Threshold: 0.70 Consistency score
-            if similarity > 0.70:
-                return True, similarity, "Identity Verified (Lightweight)", is_low_light
-            return False, similarity, "Face mismatch", is_low_light
+            from identity_compare import compare_histogram_identity
+
+            ok, msg, fc, ee, combined, _code = compare_histogram_identity(
+                profile_frame, live_frame, mode="continuous"
+            )
+            comb = float(combined) if combined is not None else float(fc or 0.0)
+            dist = max(0.0, 1.0 - comb)
+            if ok:
+                return True, dist, msg, is_low_light
+            return False, dist, msg, is_low_light
         except Exception as e:
             return False, 0.0, f"Verification System Error: {str(e)}", False
 
@@ -551,6 +603,10 @@ class ProctoringService:
         Process a single frame from the frontend.
         Returns analysis results.
         """
+        # Ensure models are ready
+        if self.model is None or self.face_mesh is None:
+            self._lazy_load_models()
+
         # Ensure we only process one frame at a time to avoid CPU spikes
         if not self.processing_lock.acquire(blocking=False):
             return {"face_detected": True, "skipping": True} # Assume face is there if busy
@@ -568,6 +624,10 @@ class ProctoringService:
                 "face_detected": False,
                 "current_warning": None
             }
+            if self.should_terminate:
+                result["should_terminate"] = True
+                result["termination_reason"] = self.termination_reason
+                return result
             person_count = 0
             gadget_detected = False
             detected_label = None
@@ -583,20 +643,25 @@ class ProctoringService:
                     
                     if len(mp_results.multi_face_landmarks) > 1:
                         self.consecutive_multi_face += 1
-                        # Wait for a brief window (~3 seconds at 2 FPS) to avoid glitches
-                        if self.consecutive_multi_face >= 6:
-                            if not hasattr(self, 'multi_face_strike_count'): self.multi_face_strike_count = 0
-                            self.multi_face_strike_count += 1
-                            self.consecutive_multi_face = 0 # RESET for next window
-                            
-                            if self.multi_face_strike_count >= 3:
-                                self.record_event("MULTIPLE_FACES_WARNING", "Security Warning: Multiple people repeatedly detected in frame. Please maintain integrity.", "HIGH", frame)
-                                result["current_warning"] = "WARNING: Multiple people detected repeatedly!"
-                            else:
-                                self.record_event("MULTIPLE_FACES", f"Security Warning ({self.multi_face_strike_count}/3): Multiple people detected in frame.", "HIGH", frame)
-                                result["current_warning"] = f"🔴 WARNING {self.multi_face_strike_count}/3: Only one person allowed in frame!"
+                        # Sustained multiple faces → end interview (exam integrity)
+                        if self.consecutive_multi_face >= 5:
+                            msg = "Interview ended: more than one person visible in the frame."
+                            self.record_event(
+                                "MULTIPLE_PEOPLE_TERMINATION",
+                                msg,
+                                "CRITICAL",
+                                frame,
+                            )
+                            result["current_warning"] = msg
+                            self.consecutive_multi_face = 0
+                        else:
+                            result["current_warning"] = (
+                                f"⚠️ Multiple people detected — only you may be on camera "
+                                f"({self.consecutive_multi_face}/5)."
+                            )
                     else:
-                        if self.consecutive_multi_face > 0: self.consecutive_multi_face -= 1
+                        if self.consecutive_multi_face > 0:
+                            self.consecutive_multi_face -= 1
                         
                         # Added: Head Orientation / Looking Away Check
                         landmarks = mp_results.multi_face_landmarks[0].landmark
@@ -626,6 +691,22 @@ class ProctoringService:
                         eyes_ok, eye_msg = self.verify_eyes(frame)
                         if not eyes_ok:
                              result["current_warning"] = f"⚠️ {eye_msg}"
+                        elif self._is_head_pitch_down(landmarks):
+                            self.consecutive_looking_down += 1
+                            if self.consecutive_looking_down >= 5:
+                                self.record_event(
+                                    "LOOKING_DOWN",
+                                    "Candidate appears to be looking down away from the screen.",
+                                    "MEDIUM",
+                                    frame,
+                                )
+                                self.consecutive_looking_down = 0
+                            result["current_warning"] = (
+                                "⚠️ Please look up at the camera — you appear to be looking down."
+                            )
+                        else:
+                            if self.consecutive_looking_down > 0:
+                                self.consecutive_looking_down -= 1
                     
                     self.face_missing_since = None # RESET TIMER
                 else:
@@ -660,10 +741,18 @@ class ProctoringService:
                                 
                                 print(f"⚠️ Proctor: Face missing (20s) - Strike {self.no_face_strike_count}")
                                 
-                                # Only terminate after 3 major violations
                                 if self.no_face_strike_count >= 3:
-                                    self.record_event("TERMINATION_NO_PERSON", "Security Violation: Candidate not visible for 20s after multiple warnings. Interview terminated.", "CRITICAL", frame)
-                                    result["current_warning"] = "TERMINATION: No person detected (3 strikes reached)!"
+                                    self.record_event(
+                                        "NO_PERSON_SEVERE",
+                                        "Face still not visible after repeated warnings — candidate must return to camera.",
+                                        "HIGH",
+                                        frame,
+                                    )
+                                    result["face_detected"] = False
+                                    result["current_warning"] = (
+                                        "🔴 Your face is still not visible — please return in front of the camera now."
+                                    )
+                                    self.no_face_strike_count = 0
                                 else:
                                     self.record_event("NO_PERSON", f"Security Warning ({self.no_face_strike_count}/3): Candidate not visible for 20s.", "HIGH", frame)
                                     result["face_detected"] = False
@@ -710,8 +799,17 @@ class ProctoringService:
                             self.no_face_strike_count += 1
                             
                             if self.no_face_strike_count >= 3:
-                                self.record_event("TERMINATION_NO_PERSON", "Security Violation: No person detected (Cascade Fallback). Interview terminated.", "CRITICAL", frame)
-                                result["current_warning"] = "TERMINATION: No person detected (3 strikes)!"
+                                self.record_event(
+                                    "NO_PERSON_SEVERE",
+                                    "Face not visible (cascade) after repeated warnings.",
+                                    "HIGH",
+                                    frame,
+                                )
+                                result["face_detected"] = False
+                                result["current_warning"] = (
+                                    "🔴 Your face is still not visible — please return in front of the camera now."
+                                )
+                                self.no_face_strike_count = 0
                             else:
                                 self.record_event("NO_PERSON", f"Security Warning ({self.no_face_strike_count}/3): No person detected for 20s.", "HIGH", frame)
                                 result["face_detected"] = False
@@ -735,8 +833,15 @@ class ProctoringService:
                     self.face_missing_since = None # RESET
                     if len(faces) > 1:
                         self.consecutive_multi_face += 1
-                        if self.consecutive_multi_face >= 3: # Reduced from 10 for immediate response
-                            self.record_event("MULTIPLE_FACES_WARNING", "Security Warning: Multiple people detected in frame (Cascade).", "HIGH", frame)
+                        if self.consecutive_multi_face >= 3:
+                            msg = "Interview ended: multiple people detected (face scan)."
+                            self.record_event("MULTIPLE_FACES_CASCADE", msg, "CRITICAL", frame)
+                            result["current_warning"] = msg
+                            self.consecutive_multi_face = 0
+                        else:
+                            result["current_warning"] = (
+                                f"⚠️ Multiple faces detected — only one person allowed ({self.consecutive_multi_face}/3)."
+                            )
                     else:
                         if self.consecutive_multi_face > 0:
                             self.consecutive_multi_face -= 1
@@ -763,12 +868,13 @@ class ProctoringService:
                                 person_count += 1
                                 detected_boxes.append((label, x1, y1, x2, y2, color))
                                 
+                            # COCO 80: phone, laptop, keyboard, remote, TV; tiny BT buds are not a class — phone/remote act as proxies.
                             PROHIBITED_GADGETS = {
                                 67: "MOBILE PHONE",
-                                63: "LAPTOP/TABLET",
-                                65: "REMOTE DEVICE",
-                                66: "EXTERNAL KEYBOARD",
-                                62: "TV/MONITOR"
+                                63: "LAPTOP",
+                                65: "REMOTE/HANDHELD DEVICE",
+                                66: "KEYBOARD",
+                                62: "TV/MONITOR",
                             }
                             
                             if cls_id in PROHIBITED_GADGETS:
@@ -792,27 +898,47 @@ class ProctoringService:
                     if not hasattr(self, 'consecutive_yolo_people'): self.consecutive_yolo_people = 0
                     self.consecutive_yolo_people += 1
                     
-                    if self.consecutive_yolo_people >= 3: # Reduced from 10 for truly immediate response
-                        self.record_event("MULTIPLE_PEOPLE_WARNING", f"Security Warning: Detected {person_count} people in frame (YOLO).", "HIGH", frame, boxes=detected_boxes)
+                    if self.consecutive_yolo_people >= 3:
+                        msg = "Interview ended: multiple people detected (vision model)."
+                        self.record_event(
+                            "MULTIPLE_PEOPLE_YOLO",
+                            msg,
+                            "CRITICAL",
+                            frame,
+                            boxes=detected_boxes,
+                        )
+                        result["current_warning"] = msg
+                        self.consecutive_yolo_people = 0
+                    else:
+                        result["current_warning"] = (
+                            f"⚠️ Multiple people may be in frame — session will end if confirmed "
+                            f"({self.consecutive_yolo_people}/3)."
+                        )
                 else:
                     if hasattr(self, 'consecutive_yolo_people') and self.consecutive_yolo_people > 0:
                         self.consecutive_yolo_people -= 1
 
                 if gadget_detected:
                     self.consecutive_phone += 1
-                    if self.consecutive_phone >= 4: # ~2 seconds at 500ms/frame — sustained device in hand
-                        self.gadget_counts += 1
-                        self.consecutive_phone = 0 # Reset frame counter, increment event counter
-                        self.record_event("GADGET_DETECTED", f"Warning {self.gadget_counts}/2: {detected_label} detected.", "HIGH", frame, boxes=detected_boxes)
-                        
-                        if self.gadget_counts >= 2:
-                            self.termination_reason = f"Prohibited device ({detected_label}) detected — session ended."
-                            self.record_event("CHEATING_DEVICE", f"Prohibited {detected_label} confirmed — interview terminated.", "CRITICAL", frame, boxes=detected_boxes)
-                            self.should_terminate = True
-                        else:
-                            result["current_warning"] = f"🔴 Remove device ({detected_label}) — one more detection ends the interview."
+                    if self.consecutive_phone >= 4:  # sustained frames (~2s at 500ms/frame cadence)
+                        self.record_event(
+                            "CHEATING_DEVICE",
+                            f"Prohibited object ({detected_label}) detected — interview terminated.",
+                            "CRITICAL",
+                            frame,
+                            boxes=detected_boxes,
+                        )
+                        result["current_warning"] = (
+                            f"Interview ended: prohibited item during interview ({detected_label})."
+                        )
+                        self.consecutive_phone = 0
+                    else:
+                        result["current_warning"] = (
+                            f"⚠️ Remove prohibited item ({detected_label}) — session will end if it stays in frame."
+                        )
                 else:
-                    if self.consecutive_phone > 0: self.consecutive_phone -= 1
+                    if self.consecutive_phone > 0:
+                        self.consecutive_phone -= 1
             
             if result.get("face_detected") and hasattr(self, 'reference_frame') and self.reference_frame is not None:
                 if not hasattr(self, '_identity_check_count'): self._identity_check_count = 0
@@ -823,6 +949,8 @@ class ProctoringService:
 
                     self._identity_check_count = 0
                     matched, distance, feedback, is_low_light = self.compare_profiles(self.reference_frame, frame)
+                    self._last_identity_match = bool(matched)
+                    self._identity_compared_once = True
                     if is_low_light: result["low_light"] = True
                     
                     if not matched:
@@ -840,9 +968,13 @@ class ProctoringService:
                                 
                                 # Relaxed from 3 to 10 to ensure NO false terminations for valid candidates
                                 if self.identity_mismatch_counts >= 10:
-                                    self.termination_reason = f"Security Violation: Identity Fraud Confirmed ({feedback})"
-                                    self.record_event("IDENTITY_FRAUD", f"Continuous verification failed: {feedback}", "CRITICAL", frame)
-                                    self.should_terminate = True
+                                    self.record_event(
+                                        "IDENTITY_FRAUD",
+                                        f"Continuous verification failed: {feedback}",
+                                        "CRITICAL",
+                                        frame,
+                                    )
+                                    # should_terminate is set inside record_event only when evidence file exists
                                 else:
                                     result["current_warning"] = f"⚠️ Warning {self.identity_mismatch_counts}/10: Identity mismatch! Please look clearly at the camera."
 
@@ -860,6 +992,12 @@ class ProctoringService:
 
             result["should_terminate"] = self.should_terminate
             result["termination_reason"] = self.termination_reason
+            if getattr(self, "reference_frame", None) is not None and getattr(
+                self, "_identity_compared_once", False
+            ):
+                result["identity_match"] = bool(
+                    result.get("face_detected") and getattr(self, "_last_identity_match", False)
+                )
             return result
         except Exception as e:
             print(f"Critical error in proctor_frame: {e}")

@@ -8,22 +8,11 @@ A professional, high-performance AI-driven interview platform featuring technica
 - **Backend**: Flask (Python 3.10+) utilizing Torch, MediaPipe, and DeepFace for advanced analysis.
 - **Database**: Dual-mode support for SQLite (Development) and PostgreSQL (Production).
 
-## 🚀 Deployment (Containerized)
-
-The easiest way to deploy the entire stack is using Docker Compose.
+## 🛠️ Local Development Setup
 
 1. **Configure Environment Variables**:
    - Copy `backend/.env.example` to `backend/.env` and fill in credentials.
-   - Copy `frontend/.env.example` to `frontend/.env` and set `NEXT_PUBLIC_API_URL`.
-
-2. **Launch the Stack**:
-   ```bash
-   docker-compose up -d --build
-   ```
-   - **Frontend**: Accessible at `http://localhost:3000`
-   - **Backend**: Accessible at `http://localhost:5000`
-
-## 🛠️ Manual Development Setup
+   - Copy `frontend/.env.example` to `frontend/.env` and set `NEXT_PUBLIC_API_URL` (for local use, typically `http://127.0.0.1:5000`).
 
 ### Backend
 ```bash

@@ -55,6 +55,33 @@ export default function ResumeUpload() {
 
         setIsSpeaking(true);
 
+        let browserFallbackUsed = false;
+        const browserFallback = () => {
+            try {
+                const utt = new SpeechSynthesisUtterance(text);
+                const voices = window.speechSynthesis.getVoices();
+                // Strictly prioritize Male voices for Atlas
+                const maleVoice = voices.find(v =>
+                    v.name.toLowerCase().includes('david') ||
+                    v.name.toLowerCase().includes('james') ||
+                    v.name.toLowerCase().includes('google us english') ||
+                    (v.name.toLowerCase().includes('male') && !v.name.toLowerCase().includes('female'))
+                );
+                if (maleVoice) utt.voice = maleVoice;
+                utt.rate = 0.9;
+                utt.pitch = 0.85; // Lower pitch for masculine feel
+                utt.onend = () => setIsSpeaking(false);
+                window.speechSynthesis.speak(utt);
+            } catch (e) {
+                setIsSpeaking(false);
+            }
+        };
+        const runBrowserFallbackOnce = () => {
+            if (browserFallbackUsed) return;
+            browserFallbackUsed = true;
+            browserFallback();
+        };
+
         const playFallback = async () => {
             if (myId !== globalSpeechTokenRef.current) return;
 
@@ -84,33 +111,12 @@ export default function ResumeUpload() {
 
                 audio.onerror = () => {
                     console.warn("⚠️ Audio playback error, using browser fallback.");
-                    browserFallback();
+                    runBrowserFallbackOnce();
                 };
 
                 await audio.play();
             } catch (err) {
-                browserFallback();
-            }
-        };
-
-        const browserFallback = () => {
-            try {
-                const utt = new SpeechSynthesisUtterance(text);
-                const voices = window.speechSynthesis.getVoices();
-                // Strictly prioritize Male voices for Atlas
-                const maleVoice = voices.find(v =>
-                    v.name.toLowerCase().includes('david') ||
-                    v.name.toLowerCase().includes('james') ||
-                    v.name.toLowerCase().includes('google us english') ||
-                    (v.name.toLowerCase().includes('male') && !v.name.toLowerCase().includes('female'))
-                );
-                if (maleVoice) utt.voice = maleVoice;
-                utt.rate = 0.9;
-                utt.pitch = 0.85; // Lower pitch for masculine feel
-                utt.onend = () => setIsSpeaking(false);
-                window.speechSynthesis.speak(utt);
-            } catch (e) {
-                setIsSpeaking(false);
+                runBrowserFallbackOnce();
             }
         };
 

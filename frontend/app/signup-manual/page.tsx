@@ -10,7 +10,7 @@ export default function SignupManual() {
     const router = useRouter();
     const { theme, toggleTheme } = useTheme();
     const [formData, setFormData] = useState({
-        name: '', email: '', phone: '', year: '', branch: '', domain: '', password: '', photo: ''
+        name: '', email: '', phone: '', year: '', branch: '', domain: '', password: '', confirmPassword: '', photo: ''
     });
     const [error, setError] = useState('');
     const [loading, setLoading] = useState(false);
@@ -74,6 +74,14 @@ export default function SignupManual() {
 
     const handleSubmit = async (e: React.FormEvent) => {
         e.preventDefault();
+        if (formData.password !== formData.confirmPassword) {
+            setError('Passwords do not match.');
+            return;
+        }
+        if (formData.password.length < 6) {
+            setError('Password must be at least 6 characters.');
+            return;
+        }
         if (!formData.photo) {
             setError('Please capture your photo for identity verification.');
             return;
@@ -301,6 +309,16 @@ export default function SignupManual() {
                                 showToggle={true}
                                 onToggle={() => setShowPassword(!showPassword)}
                                 isVisible={showPassword}
+                            />
+                            <InputField 
+                                label="Confirm Password" 
+                                name="confirmPassword" 
+                                type={showPassword ? "text" : "password"} 
+                                icon={<Lock size={16} />} 
+                                value={formData.confirmPassword} 
+                                onChange={handleChange} 
+                                placeholder="Repeat password" 
+                                theme={theme}
                             />
                         </div>
 

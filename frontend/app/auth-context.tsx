@@ -1,6 +1,7 @@
 "use client";
 
 import React, { createContext, useState, useContext, useEffect } from 'react';
+import { profilePhotoSrc } from '@/lib/profilePhotoSrc';
 
 type User = {
     id: number;
@@ -22,6 +23,14 @@ type User = {
     resume_feedback?: string;
 };
 
+/** Ensure stored profile photo works as an <img src> (raw base64 → data URL). */
+function withDisplayablePhoto<T extends { photo?: string }>(u: T): T {
+  if (!u?.photo?.trim()) return u;
+  const fixed = profilePhotoSrc(u.photo);
+  if (!fixed || fixed === u.photo) return u;
+  return { ...u, photo: fixed };
+}
+
 type AuthContextType = {
     user: User | null;
     loading: boolean;
@@ -39,19 +48,21 @@ const AuthContext = createContext<AuthContextType>({
 });
 
 export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
-    const [user, setUser] = useState<User | null>(() => {
-        if (typeof window === 'undefined') return null;
-        const stored = localStorage.getItem('user_session');
-        if (!stored) return null;
-        try {
-            return JSON.parse(stored);
-        } catch {
-            return null;
-        }
-    });
+    const [user, setUser] = useState<User | null>(null);
     const [loading] = useState(false);
 
     useEffect(() => {
+        if (typeof window !== 'undefined') {
+            const stored = localStorage.getItem('user_session');
+            if (stored) {
+                try {
+                    setUser(withDisplayablePhoto(JSON.parse(stored)));
+                } catch {
+                    setUser(null);
+                }
+            }
+        }
+        
         // ── Cross-tab logout sync ─────────────────────────────────────────
         const handleStorageChange = (event: StorageEvent) => {
             if (event.key === 'user_session' || event.key === 'admin_session') {
@@ -65,7 +76,7 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
                 } else if (event.key === 'user_session') {
                     // Session was updated (e.g. profile save) → sync user data
                     try {
-                        setUser(JSON.parse(event.newValue));
+                        setUser(withDisplayablePhoto(JSON.parse(event.newValue)));
                     } catch (e) {
                         console.error("Failed to sync user session across tabs", e);
                     }
@@ -81,8 +92,9 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
     }, []);
 
     const login = (userData: User) => {
-        setUser(userData);
-        localStorage.setItem('user_session', JSON.stringify(userData));
+        const u = withDisplayablePhoto(userData);
+        setUser(u);
+        localStorage.setItem('user_session', JSON.stringify(u));
     };
 
     const logout = () => {
@@ -101,14 +113,15 @@ export const AuthProvider = ({ children }: { children: React.ReactNode }) => {
     };
 
     const updateUser = (userData: User) => {
-        setUser(userData);
+        const u = withDisplayablePhoto(userData);
+        setUser(u);
         try {
-            localStorage.setItem('user_session', JSON.stringify(userData));
+            localStorage.setItem('user_session', JSON.stringify(u));
         } catch (e) {
             console.error("LocalStorage Update Failed (Quota likely exceeded):", e);
             // Fallback: save without photo if it's the culprit
-            if (userData.photo) {
-                const { photo, ...rest } = userData;
+            if (u.photo) {
+                const { photo, ...rest } = u;
                 localStorage.setItem('user_session', JSON.stringify(rest));
             }
         }

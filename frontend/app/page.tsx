@@ -9,8 +9,37 @@ import { Sun, Moon, Shield, ShieldAlert, Camera, Mic, Monitor, User, CheckCircle
 import { useTheme } from './theme-context';
 import Editor from "@monaco-editor/react";
 
+/** Survives React Strict Mode double-mount so setup-route warnings are not spoken twice. */
+let __voiceDedupeKey = "";
+let __voiceDedupeAt = 0;
+function runVoiceOnceWithinMs(key: string, windowMs: number, fn: () => void) {
+  const now = Date.now();
+  if (__voiceDedupeKey === key && now - __voiceDedupeAt < windowMs) return;
+  __voiceDedupeKey = key;
+  __voiceDedupeAt = now;
+  fn();
+}
+
+/** Ignore STT that matches the agent's current question (speaker bleed picking up TTS). */
+function looksLikeAgentQuestionEcho(userText: string, agentQuestion: string): boolean {
+  const u = userText.toLowerCase().replace(/\s+/g, ' ').trim();
+  const q = (agentQuestion || '').toLowerCase().replace(/\s+/g, ' ').trim();
+  if (!u || !q || u.length < 10) return false;
+  const head = (s: string) => s.slice(0, Math.min(52, s.length));
+  if (q.length >= 18 && u.includes(head(q))) return true;
+  if (u.length >= 18 && q.includes(head(u))) return true;
+  const qWords = q.split(/\s+/).filter((w) => w.length > 4);
+  if (qWords.length < 4) return false;
+  const uSet = new Set(u.split(/\s+/));
+  let hit = 0;
+  for (const w of qWords) {
+    if (uSet.has(w)) hit++;
+  }
+  return hit / qWords.length >= 0.42;
+}
+
 function HomeContent() {
-  const { user, logout, loading: authLoading } = useAuth();
+  const { user, logout, loading: authLoading, updateUser } = useAuth();
   const { theme, toggleTheme } = useTheme();
   const router = useRouter();
 
@@ -20,7 +49,11 @@ function HomeContent() {
   const [email, setEmail] = useState('');
   const [file, setFile] = useState<File | null>(null);
   const [loading, setLoading] = useState(false);
-  const [proctorStatus, setProctorStatus] = useState({ face: false, warning: '' });
+  const [proctorStatus, setProctorStatus] = useState<{
+    face: boolean;
+    warning: string;
+    identityMatch: boolean | null;
+  }>({ face: false, warning: '', identityMatch: null });
 
   useEffect(() => {
     if (user) {
@@ -39,14 +72,14 @@ function HomeContent() {
       const isPractice = searchParams?.get('mode') === 'practice';
       if (!isPractice && (!user.interviews_remaining || user.interviews_remaining <= 0)) {
         const msg = "Your evaluation attempts are exhausted. Please subscribe to a package to continue your training.";
-        speak(msg);
+        runVoiceOnceWithinMs(`credits-${user.id}`, 2500, () => speak(msg));
         setFeedback("⚠️ " + msg);
         setTimeout(() => router.push('/pricing'), 3500);
         return;
       }
       if (!user.plan_id) {
         const msg = "Please select a professional plan to initiate the core and specialized assessment modules.";
-        speak(msg);
+        runVoiceOnceWithinMs(`plan-${user.id}`, 2500, () => speak(msg));
         setFeedback("⚠️ " + msg);
         setTimeout(() => router.push('/pricing'), 3500);
         return;
@@ -79,7 +112,6 @@ function HomeContent() {
   const [workflowSessionId, setWorkflowSessionId] = useState<string | null>(null);
   const [isFinishing, setIsFinishing] = useState(false);
   const [feedback, setFeedback] = useState('');
-  const [nameWarning, setNameWarning] = useState('');
   const [questionCount, setQuestionCount] = useState(0);
   const [phase, setPhase] = useState('warmup');
   const [phaseCount, setPhaseCount] = useState(0);
@@ -121,14 +153,14 @@ function HomeContent() {
     }
     if (pId === 2) { // ATS Pro
       return [
-        'greeting', 'warmup', 'warmup', 'intro', 'resume_skills', 'resume_projects', 'resume_overview',
+        'greeting', 'warmup', 'intro', 'resume_skills', 'resume_projects', 'resume_overview',
         'scenario_technical', 'technical_core', 'technical_advanced', 'case_study',
         'scenario_behavioral', 'code', 'code', 'scenario_hr', 'conclusion'
       ];
     }
     if (pId === 3) { // Proctor Elite
       return [
-        'greeting', 'warmup', 'warmup', 'intro', 'resume_skills', 'resume_projects', 'resume_overview',
+        'greeting', 'warmup', 'intro', 'resume_skills', 'resume_projects', 'resume_overview',
         'scenario_technical', 'technical_core', 'technical_advanced', 'case_study',
         'scenario_behavioral', 'code', 'code',
         'scenario_hr', 'leadership', 'teamwork', 'adaptability', 'conclusion'
@@ -137,7 +169,7 @@ function HomeContent() {
 
     if (pId === 4) { // Ultimate Bundle
       return [
-        'greeting', 'warmup', 'warmup', 'intro', 'resume_skills', 'resume_projects', 'resume_overview',
+        'greeting', 'warmup', 'intro', 'resume_skills', 'resume_projects', 'resume_overview',
         'scenario_technical', 'technical_core', 'technical_advanced', 'case_study',
         'scenario_behavioral', 'code', 'code',
         'scenario_hr', 'leadership', 'teamwork', 'adaptability', 'future_goals', 'conclusion'
@@ -211,7 +243,7 @@ function HomeContent() {
     localStorage.setItem('interview_session_id', sid);
   };
 
-  // INACTIVITY & SILENCE HANDLING
+  // INACTIVITY (no per-interview silence countdown — removed 30s timer UX)
   const inactivityTimerRef = useRef<NodeJS.Timeout | null>(null);
   const hasRepeatedRef = useRef(false);
   const lastActivityRef = useRef<number>(Date.now());
@@ -219,7 +251,7 @@ function HomeContent() {
   const getPhaseThreshold = (pIndex: number) => {
     const p = PHASES[pIndex];
     if (p === 'greeting') return 1;
-    if (p === 'warmup') return 2;
+    if (p === 'warmup') return 1;
     if (p === 'intro') return 1;
     if (p === 'resume_overview') return 1;
     if (p === 'resume_skills') return 1;
@@ -299,27 +331,8 @@ function HomeContent() {
   const [verifyImage, setVerifyImage] = useState<string | null>(null);
   const [verifying, setVerifying] = useState(false);
   const [verifyFailCount, setVerifyFailCount] = useState(0);
+  const [verifyFaceCode, setVerifyFaceCode] = useState<string | null>(null);
   const [frequencyData, setFrequencyData] = useState<number[]>(new Array(16).fill(0));
-  const [silenceCountdown, setSilenceCountdown] = useState<number | null>(null);
-  const [isSilenced, setIsSilenced] = useState(false);
-  const lastSpeechTimeRef = useRef<number>(Date.now());
-
-  useEffect(() => {
-    let t: NodeJS.Timeout;
-    if (silenceCountdown !== null && silenceCountdown > 0) {
-      t = setInterval(() => {
-        setSilenceCountdown(prev => (prev !== null && prev > 0) ? prev - 1 : 0);
-      }, 1000);
-    } else if (silenceCountdown === 0) {
-      // Stop recording automatically when timer hits zero
-      if (recognitionRef.current && isListening) {
-        console.log("⏲️ Timer reached 0. Stopping recording.");
-        try { recognitionRef.current.stop(); } catch (e) { }
-        setIsListening(false);
-      }
-    }
-    return () => clearInterval(t);
-  }, [silenceCountdown, isListening]);
 
   const recognitionRef = useRef<any>(null);
   const recognitionInstanceRef = useRef<any>(null);
@@ -335,6 +348,8 @@ function HomeContent() {
   // Web Audio API lip-sync — direct DOM refs to avoid 60fps React re-renders
   const lipSyncBarsRef = useRef<HTMLDivElement[]>([]);
   const lipSyncRafRef = useRef<number | null>(null);
+  const lipSyncDisposeRef = useRef<(() => void) | null>(null);
+  const speakDeferTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     if (stage === 'landing') {
@@ -412,7 +427,6 @@ function HomeContent() {
   useEffect(() => {
     latestFnRef.current = {
       resetInactivityTimer,
-      resetSilenceTimer,
       handleInactivity,
       handleSubmitAnswer,
       handlePhaseProgress,
@@ -423,19 +437,8 @@ function HomeContent() {
     };
   });
 
-  const silenceTimerRef = useRef<NodeJS.Timeout | null>(null);
-  const resetSilenceTimer = () => {
-    if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
-    setSilenceCountdown(null);
-    setIsSilenced(false);
-
-    if (stage !== 'interview' || isSpeakingRef.current) return;
-
-    // Use a persistent effect for the countdown instead of a simple timeout
-    // the actual trigger happens in the audioLevel loop
-  };
-
   const handleInactivity = async () => {
+    if (isTerminatingRef.current) return;
     if (stage !== 'interview' || isSpeakingRef.current) return;
 
     if (!hasRepeatedRef.current) {
@@ -465,9 +468,9 @@ function HomeContent() {
         });
       } catch (e) { console.error("Silence submission error", e); }
 
-      speak("Since I haven't received a response in the last minute, I will move on to the next part of our interview to ensure we stay on schedule.", () => {
-        handlePhaseProgress();
-      });
+      if (isTerminatingRef.current) return;
+
+      handlePhaseProgress();
     }
   };
 
@@ -508,27 +511,8 @@ function HomeContent() {
         analyserRef.current.getByteFrequencyData(dataArray);
 
         const average = dataArray.reduce((p, c) => p + c, 0) / dataArray.length;
-        const currentLevel = average * 4.0;
+        const currentLevel = average * 7.0;
         setAudioLevel(currentLevel);
-
-        // SILENCE DETECTION FOR 30S TIMER
-        if (stage === 'interview' && !isSpeakingRef.current) {
-          if (currentLevel > 15) {
-            lastSpeechTimeRef.current = Date.now();
-            if (isSilenced) {
-              console.log("🗣️ Speech resumed - resetting timer");
-              setIsSilenced(false);
-              setSilenceCountdown(null);
-            }
-          } else {
-            const silenceDuration = Date.now() - lastSpeechTimeRef.current;
-            if (silenceDuration > 2000 && !isSilenced) { // 2s silence
-              console.log("⏸️ Silence detected - starting 30s countdown");
-              setIsSilenced(true);
-              setSilenceCountdown(30);
-            }
-          }
-        }
 
         const bars = 16;
         const step = Math.floor(dataArray.length / 2 / bars);
@@ -676,11 +660,15 @@ function HomeContent() {
                 facingMode: "user"
               },
               audio: {
-                echoCancellation: true,
-                noiseSuppression: true,
+                echoCancellation: false,
+                noiseSuppression: false,
                 autoGainControl: true,
+                googAutoGainControl: true,
+                googNoiseSuppression: false,
+                googHighpassFilter: false,
+                channelCount: 1,
                 sampleRate: 48000
-              }
+              } as any
             });
           } catch {
             console.warn("⚠️ Balanced camera failed — retrying with basic constraints");
@@ -886,10 +874,18 @@ function HomeContent() {
           const cleanFinalAdd = currentFinalChunks.join(' ').trim();
 
           // 2. State synchronization (Update interim first for speed)
-          setInterimTranscript(currentInterim);
+          const qNow = questionRef.current || '';
+          if (looksLikeAgentQuestionEcho(currentInterim.trim(), qNow)) {
+            setInterimTranscript('');
+          } else {
+            setInterimTranscript(currentInterim);
+          }
 
           // 3. Process committed (final) phrase
           if (cleanFinalAdd) {
+            if (looksLikeAgentQuestionEcho(cleanFinalAdd, qNow)) {
+              console.log("🎤 Ignoring final phrase (matches agent question / echo)");
+            } else {
             console.log("🎤 Final committed phrase:", cleanFinalAdd);
 
             const lowerText = cleanFinalAdd.toLowerCase();
@@ -910,12 +906,12 @@ function HomeContent() {
               const prevTrim = prev.trim();
               return prevTrim ? `${prevTrim} ${cleanFinalAdd}` : cleanFinalAdd;
             });
+            }
           }
 
           // 4. Activity heartbeat
           if (cleanFinalAdd || currentInterim) {
             latestFnRef.current.resetInactivityTimer?.();
-            latestFnRef.current.resetSilenceTimer?.();
           }
         };
 
@@ -962,8 +958,8 @@ function HomeContent() {
       if (hasStartedRef.current && isStillInInterview && !shouldMicBeOff) {
         // Restart if engine stayed silent despite user speaking, or if session just timed out
         const silenceDuration = now - lastResultTimeRef.current;
-        const isStalled = recognitionActiveRef.current && silenceDuration > 10000;
-        const isMissedSound = (audioLevel > 10) && silenceDuration > 4000 && recognitionActiveRef.current;
+        const isStalled = recognitionActiveRef.current && silenceDuration > 14000;
+        const isMissedSound = (audioLevel > 3) && silenceDuration > 3500 && recognitionActiveRef.current;
 
         if (isStalled || isMissedSound) {
           console.log(isMissedSound ? "🔥 Mic missed sounds (Low Level). Force Restarting..." : "🔄 Voice engine stalled. Restarting...");
@@ -999,9 +995,6 @@ function HomeContent() {
   const handleSubmitAnswer = async () => {
     if (showFullscreenWarnRef.current || showTabSwitchWarnRef.current) return;
     if (fetchingQuestion || isTranscribing) return; // Busy lock
-    if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
-    setIsSilenced(false);
-    setSilenceCountdown(null);
 
     if (typeof window !== 'undefined') {
       window.speechSynthesis.cancel();
@@ -1085,6 +1078,11 @@ function HomeContent() {
       });
       const data = await res.json();
 
+      if (isTerminatingRef.current) {
+        setFetchingQuestion(false);
+        return;
+      }
+
       // If we got the next question in the same response, use it immediately!
       if (data.next_question) {
         setFetchingQuestion(false);
@@ -1120,6 +1118,7 @@ function HomeContent() {
   };
 
   const handlePhaseProgress = (acknowledgment?: string) => {
+    if (isTerminatingRef.current) return;
     let nextCount = phaseCount + 1;
     let nextIndex = phaseIndex;
 
@@ -1156,20 +1155,33 @@ function HomeContent() {
     try {
       const apiUrl = `${apiBase}/api/interview/question?category=${cat}&user_id=${user?.id || ''}&section=${searchParams?.get('section') || ''}&mode=${searchParams?.get('mode') || ''}&session_id=${encodeURIComponent(workflowSessionId || '')}`;
       const res = await fetch(apiUrl);
+      if (isTerminatingRef.current) {
+        setFetchingQuestion(false);
+        return;
+      }
       if (res.status === 403) {
         const errData = await res.json().catch(() => ({}));
         const msg = errData.message || "Interview node locked. 0 Credits remaining.";
-        speak(msg);
+        if (!isTerminatingRef.current) {
+          speak(msg);
+        }
         setFeedback("⚠️ " + msg);
         setTimeout(() => router.push('/pricing'), 3000);
         return;
       }
       const data = await res.json();
+
+      if (isTerminatingRef.current) {
+        setFetchingQuestion(false);
+        return;
+      }
       
       if (data.status === 'error') {
         const err = data.message || "Error fetching question.";
         setFeedback("⚠️ " + err);
-        speak("I'm sorry, I'm having trouble fetching the next question. Please check your connection.");
+        if (!isTerminatingRef.current) {
+          speak("I'm sorry, I'm having trouble fetching the next question. Please check your connection.");
+        }
         return;
       }
 
@@ -1178,7 +1190,9 @@ function HomeContent() {
       setQuestion(q);
       questionRef.current = q;
       // Removed acknowledgement to follow "no feedback during interview" rule
-      speak(q);
+      if (!isTerminatingRef.current) {
+        speak(q);
+      }
       setFetchingQuestion(false);
     } catch (e) {
       console.error(e);
@@ -1192,6 +1206,10 @@ function HomeContent() {
     try {
       const res = await fetch(`${typeof window !== 'undefined' ? (process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5000') : (process.env.INTERNAL_BACKEND_URL || 'http://backend:5000')}/api/get_problems`);
       const data = await res.json();
+      if (isTerminatingRef.current) {
+        setLoading(false);
+        return;
+      }
       if (data.status === 'success' && data.problems.length > 0) {
         // Backend returns exactly two session-locked problems (random pair per interview)
         setCodingProblems(data.problems.slice(0, 2));
@@ -1284,6 +1302,11 @@ function HomeContent() {
         })
       });
 
+      if (isTerminatingRef.current) {
+        setLoading(false);
+        return;
+      }
+
       if (currentCodingIdx < codingProblems.length - 1) {
         setCurrentCodingIdx(prev => prev + 1);
         setCodeAnswer('');
@@ -1334,7 +1357,16 @@ function HomeContent() {
   // Helper to terminate and generate report
   const handleTermination = (reason: string) => {
     if (isTerminatingRef.current) return;
+    cancelPendingVoice();
     isTerminatingRef.current = true;
+
+    // Dismiss security overlays immediately — they use z-[300+] and would otherwise
+    // stay mounted and block clicks on the results / access-terminated screens.
+    setShowFullscreenWarn(false);
+    showFullscreenWarnRef.current = false;
+    setShowTabSwitchWarn(false);
+    showTabSwitchWarnRef.current = false;
+    setShowEndConfirm(false);
 
     const isSuccess = reason.toLowerCase().includes("successfully");
 
@@ -1364,7 +1396,7 @@ function HomeContent() {
         setStage('report');
       }
       handleDownloadReport();
-    });
+    }, true, true);
 
     // Fallback if audio fails
     setTimeout(() => {
@@ -1373,6 +1405,62 @@ function HomeContent() {
       handleDownloadReport(); // Still check ref here, handleDownloadReport now has its own lock
     }, 5000);
   };
+
+  /** Upload one camera frame as proctor evidence before ending session (required for fair termination + PDF). */
+  async function terminateWithCameraEvidence(reason: string, eventType: string, detailMsg: string) {
+    if (typeof window === 'undefined') return;
+    let activeVideo: HTMLVideoElement | null =
+      (document.getElementById('main-video') as HTMLVideoElement | null) || videoRef.current;
+    if ((!activeVideo || activeVideo.readyState < 2) && stage === 'verification') {
+      activeVideo = document.getElementById('verification-video') as HTMLVideoElement | null;
+    }
+    if (!activeVideo || activeVideo.readyState < 2) {
+      setFeedback(
+        '⚠️ Incident evidence could not be captured (camera not ready). Stay in view with the interview tab focused, then try again.'
+      );
+      return;
+    }
+    try {
+      const canvas = document.createElement('canvas');
+      canvas.width = 640;
+      canvas.height = 480;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) {
+        setFeedback('⚠️ Could not capture camera proof (graphics error).');
+        return;
+      }
+      ctx.drawImage(activeVideo, 0, 0, 640, 480);
+      const img = canvas.toDataURL('image/jpeg', 0.75);
+      const res = await fetch(`${apiBase}/proctor/event`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          type: eventType,
+          message: detailMsg,
+          severity: 'HIGH',
+          image: img,
+        }),
+      });
+      if (!res.ok) {
+        setFeedback('⚠️ Failed to upload incident evidence. Check your connection, then try again.');
+        return;
+      }
+    } catch {
+      setFeedback('⚠️ Failed to upload incident evidence.');
+      return;
+    }
+    handleTermination(reason);
+  }
+
+  /** Proctor warning layers (z 300+) must not cover report/results — they would steal all clicks. */
+  useEffect(() => {
+    if (stage !== 'report' && stage !== 'results') return;
+    setShowFullscreenWarn(false);
+    showFullscreenWarnRef.current = false;
+    setShowTabSwitchWarn(false);
+    showTabSwitchWarnRef.current = false;
+    setShowEndConfirm(false);
+  }, [stage]);
 
   // FORCE FULLSCREEN ON STAGE CHANGE
   useEffect(() => {
@@ -1414,7 +1502,11 @@ function HomeContent() {
         });
 
         if (userPlan >= 1 && fullscreenWarnCountRef.current >= 2) {
-          handleTermination("Security violation: Fullscreen was left more than once. Ending interview and generating your report.");
+          void terminateWithCameraEvidence(
+            'Security violation: Fullscreen was left more than once. Ending interview and generating your report.',
+            'FULLSCREEN_TERMINATION',
+            `Fullscreen exit — evidence frame (attempt ${fullscreenWarnCountRef.current}).`
+          );
         } else {
           setShowFullscreenWarn(true);
           showFullscreenWarnRef.current = true;
@@ -1451,7 +1543,11 @@ function HomeContent() {
           })
         });
         if (userPlan >= 1 && tabSwitchCountRef.current >= 2) {
-          handleTermination("Security violation: Tab or window switch detected again. Ending interview and generating your report.");
+          void terminateWithCameraEvidence(
+            'Security violation: Tab or window switch detected again. Ending interview and generating your report.',
+            'TAB_SWITCH_TERMINATION',
+            `Tab/window blur — evidence frame (attempt ${tabSwitchCountRef.current}).`
+          );
         } else {
           setShowTabSwitchWarn(true);
           showTabSwitchWarnRef.current = true;
@@ -1579,7 +1675,11 @@ function HomeContent() {
 
       // EXTENSION CHECK
       if (detectExtensions() && (stage === 'interview' || stage === 'code')) {
-        handleTermination("Security Violation: Browser extensions (like Grammarly or Translate) detected. Please disable all extensions to continue.");
+        void terminateWithCameraEvidence(
+          'Security Violation: Browser extensions (like Grammarly or Translate) detected. Please disable all extensions to continue.',
+          'EXTENSION_TERMINATION',
+          'Browser extension / injected script indicators visible at termination time.'
+        );
         return;
       }
 
@@ -1629,8 +1729,11 @@ function HomeContent() {
           // Require 4 consecutive failures (~2 seconds) before showing 'No Face'
           const smoothFaceDetected = noFaceRef.current < 4;
 
-          if (prev.face === smoothFaceDetected && prev.warning === warning) return prev;
-          return { face: smoothFaceDetected, warning: warning };
+          const im =
+            typeof data.identity_match === 'boolean' ? data.identity_match : prev.identityMatch;
+
+          if (prev.face === smoothFaceDetected && prev.warning === warning && prev.identityMatch === im) return prev;
+          return { face: smoothFaceDetected, warning: warning, identityMatch: im };
         });
 
         // Only terminate in active stages. 
@@ -1686,22 +1789,92 @@ function HomeContent() {
     v.muted = true;
     v.play().catch(() => { });
 
+    let resumeTimer: ReturnType<typeof setTimeout> | null = null;
+
     if (isSpeaking) {
-      // Stop mic while agent is speaking
       if (recognitionRef.current && recognitionActiveRef.current) {
         try { recognitionRef.current.stop(); } catch (e) { }
       }
     } else {
-      // Agent done speaking — start listening
-      if (stage === 'interview') safeStartRecognition();
+      // Brief delay after TTS ends so mic does not pick up trailing audio as "user transcript"
+      resumeTimer = setTimeout(() => {
+        resumeTimer = null;
+        if (!isSpeakingRef.current) {
+          safeStartRecognition();
+        }
+      }, 480);
     }
+
+    return () => {
+      if (resumeTimer) clearTimeout(resumeTimer);
+    };
   }, [isSpeaking, stage]);
+
+  /** Stops deferred speak timers, invalidates in-flight TTS fetches, and tears down audio. Call when ending the interview. */
+  const cancelPendingVoice = () => {
+    if (speakDeferTimerRef.current) {
+      clearTimeout(speakDeferTimerRef.current);
+      speakDeferTimerRef.current = null;
+    }
+    globalSpeechTokenRef.current += 1;
+    if (audioRef.current) {
+      try {
+        const oldAudio = audioRef.current;
+        audioRef.current = null;
+        oldAudio.onplay = null;
+        oldAudio.onended = null;
+        oldAudio.onerror = null;
+        oldAudio.oncanplaythrough = null;
+        oldAudio.pause();
+        oldAudio.src = '';
+      } catch {
+        /* ignore */
+      }
+    }
+    try {
+      window.speechSynthesis?.cancel();
+    } catch {
+      /* ignore */
+    }
+    setIsSpeaking(false);
+    isSpeakingRef.current = false;
+    if (inactivityTimerRef.current) {
+      clearTimeout(inactivityTimerRef.current);
+      inactivityTimerRef.current = null;
+    }
+  };
 
   /* FAILSAFE TTS AUDIO REF */
 
-  const speak = (text: string, onComplete?: () => void, bypassDeferral = false) => {
+  const speak = (text: string, onComplete?: () => void, bypassDeferral = false, allowDuringTermination = false) => {
     if (typeof window === 'undefined') return;
+    if (isTerminatingRef.current && !allowDuringTermination) {
+      return;
+    }
     const synth = window.speechSynthesis;
+
+    if (speakDeferTimerRef.current) {
+      clearTimeout(speakDeferTimerRef.current);
+      speakDeferTimerRef.current = null;
+    }
+
+    if (lipSyncRafRef.current) {
+      cancelAnimationFrame(lipSyncRafRef.current);
+      lipSyncRafRef.current = null;
+    }
+    lipSyncBarsRef.current.forEach((bar) => {
+      if (bar) {
+        bar.style.animation = '';
+        bar.style.height = '3px';
+      }
+    });
+    if (agentVideoRef.current) agentVideoRef.current.playbackRate = 1.0;
+    try {
+      lipSyncDisposeRef.current?.();
+    } catch {
+      /* ignore */
+    }
+    lipSyncDisposeRef.current = null;
 
     // 1. Generate new unique ID for this speech request
     const myId = ++globalSpeechTokenRef.current;
@@ -1752,16 +1925,22 @@ function HomeContent() {
         document.documentElement.requestFullscreen().catch(() => { });
       }
 
-      setTimeout(() => {
+      speakDeferTimerRef.current = setTimeout(() => {
+        speakDeferTimerRef.current = null;
         if (myId !== globalSpeechTokenRef.current) return; // Stale
         (window as any)._lastDeferredText = null;
-        speak(text, onComplete, bypassDeferral);
+        speak(text, onComplete, bypassDeferral, allowDuringTermination);
       }, 1500);
       return;
     }
 
     const playFallback = async () => {
       if (myId !== globalSpeechTokenRef.current) return;
+      if (isTerminatingRef.current && !allowDuringTermination) {
+        setIsSpeaking(false);
+        isSpeakingRef.current = false;
+        return;
+      }
       if (showFullscreenWarnRef.current || showTabSwitchWarnRef.current) return;
 
       console.log("🔊 Fetching OpenAI TTS for:", text.slice(0, 50));
@@ -1782,6 +1961,12 @@ function HomeContent() {
         const audioUrl = URL.createObjectURL(blob);
 
         if (myId !== globalSpeechTokenRef.current) return;
+        if (isTerminatingRef.current && !allowDuringTermination) {
+          URL.revokeObjectURL(audioUrl);
+          setIsSpeaking(false);
+          isSpeakingRef.current = false;
+          return;
+        }
 
         const audio = new Audio(audioUrl);
         audioRef.current = audio;
@@ -1794,7 +1979,8 @@ function HomeContent() {
           setIsSpeaking(false);
           isSpeakingRef.current = false;
           if (onComplete) onComplete();
-          if (stage === 'interview') {
+          const st = latestFnRef.current?.stage;
+          if (!isTerminatingRef.current && (st === 'interview' || st === 'code')) {
             safeStartRecognition();
             latestFnRef.current?.resetInactivityTimer?.();
           }
@@ -1810,11 +1996,30 @@ function HomeContent() {
         if (audioContextRef.current && audioContextRef.current.state === 'suspended') {
           await audioContextRef.current.resume();
         }
+        if (myId !== globalSpeechTokenRef.current || (isTerminatingRef.current && !allowDuringTermination)) {
+          try {
+            audio.pause();
+            audio.src = '';
+            if (audioRef.current === audio) audioRef.current = null;
+          } catch {
+            /* ignore */
+          }
+          URL.revokeObjectURL(audioUrl);
+          stopLipSync();
+          setIsSpeaking(false);
+          isSpeakingRef.current = false;
+          return;
+        }
         await audio.play();
       } catch (err: any) {
         console.warn("⚠️ TTS fetch failed (using local fallback):", err.message);
         // Browser Speech Synthesis Fallback
         try {
+          if (myId !== globalSpeechTokenRef.current || (isTerminatingRef.current && !allowDuringTermination)) {
+            setIsSpeaking(false);
+            isSpeakingRef.current = false;
+            return;
+          }
           const utt = new SpeechSynthesisUtterance(text);
           
           // Use Male Voice for consistency
@@ -1844,6 +2049,11 @@ function HomeContent() {
             setTimeout(() => { setIsSpeaking(false); isSpeakingRef.current = false; }, 1000);
             if (onComplete) onComplete();
           };
+          if (isTerminatingRef.current && !allowDuringTermination) {
+            setIsSpeaking(false);
+            isSpeakingRef.current = false;
+            return;
+          }
           window.speechSynthesis.speak(utt);
         } catch (e) {
           setIsSpeaking(false);
@@ -1858,16 +2068,31 @@ function HomeContent() {
         cancelAnimationFrame(lipSyncRafRef.current);
         lipSyncRafRef.current = null;
       }
-      // Reset bars to flat
-      lipSyncBarsRef.current.forEach(bar => {
-        if (bar) bar.style.height = '3px';
+      lipSyncBarsRef.current.forEach((bar) => {
+        if (bar) {
+          bar.style.animation = '';
+          bar.style.height = '3px';
+        }
       });
       if (agentVideoRef.current) agentVideoRef.current.playbackRate = 1.0;
+      try {
+        lipSyncDisposeRef.current?.();
+      } catch {
+        /* ignore */
+      }
+      lipSyncDisposeRef.current = null;
     };
 
     // Helper: start Web Audio API lip-sync loop
     const startLipSync = (audioEl: HTMLAudioElement) => {
       try {
+        try {
+          lipSyncDisposeRef.current?.();
+        } catch {
+          /* ignore */
+        }
+        lipSyncDisposeRef.current = null;
+
         // Use SHARED context to avoid suspension
         if (!audioContextRef.current) {
             audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
@@ -1877,8 +2102,22 @@ function HomeContent() {
         analyser.fftSize = 64;
         analyser.smoothingTimeConstant = 0.6;
         const source = audioCtx.createMediaElementSource(audioEl);
+        // Analyser is a tap only — do NOT chain analyser → destination or some
+        // browsers play the clip twice (media element path + graph path).
         source.connect(analyser);
-        analyser.connect(audioCtx.destination);
+        source.connect(audioCtx.destination);
+        lipSyncDisposeRef.current = () => {
+          try {
+            source.disconnect();
+          } catch {
+            /* ignore */
+          }
+          try {
+            analyser.disconnect();
+          } catch {
+            /* ignore */
+          }
+        };
         const bufferLen = analyser.frequencyBinCount;
         const dataArray = new Uint8Array(bufferLen);
 
@@ -1937,17 +2176,26 @@ function HomeContent() {
     console.log("🔊 Audio Unlocked & Context Initialized.");
   };
 
-  const handleBeginInterview = async (e?: any, bypass: boolean = false) => {
+  const handleBeginInterview = async (e?: any) => {
     if (!file || !name) {
       alert("Please enter your name and upload a resume.");
       return;
     }
 
-    // 1. Immediate Audio Unlock & Feedback
-    if (!bypass) speak("Analyzing your resume. Please wait a moment.");
-
     isTerminatingRef.current = false;
-    setNameWarning('');
+
+    // Step 1 (voice): "please wait / verifying" — must finish before step 2 (result voice) to avoid clash.
+    // Runs in parallel with upload; we wait for both so the result is never spoken over the intro.
+    const introSpeechDone = Promise.race([
+      new Promise<void>((resolve) => {
+        speak(
+          "Please wait while we verify your resume. This may take a few seconds.",
+          resolve,
+          true
+        );
+      }),
+      new Promise<void>((resolve) => setTimeout(resolve, 45000)),
+    ]);
 
     setLoading(true);
     const formData = new FormData();
@@ -1955,58 +2203,86 @@ function HomeContent() {
     formData.append('name', name);
     formData.append('email', email);
     if (user) formData.append('user_id', String(user.id));
-    if (bypass) formData.append('bypass_name_check', 'true');
 
-    try {
+    const uploadOnce = async () => {
       const res = await fetch(`${apiBase}/api/upload_resume`, {
         method: 'POST',
-        body: formData
+        body: formData,
       });
-      const data = await res.json();
+      let data: Record<string, unknown> = {};
+      try {
+        data = await res.json();
+      } catch {
+        data = { status: 'error', message: 'Invalid response from server.' };
+      }
+      return { res, data };
+    };
+
+    try {
+      const [{ res, data }] = await Promise.all([uploadOnce(), introSpeechDone]);
+
       if (data.status === 'success') {
-        persistWorkflowSession(data.session_id);
-        // Start proctoring
+        persistWorkflowSession(
+          typeof data.session_id === 'string' ? data.session_id : null
+        );
         await fetch(`${apiBase}/proctor/start`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ user_id: user?.id, session_id: data.session_id || workflowSessionId }),
+          body: JSON.stringify({ user_id: user?.id, session_id: (data.session_id as string) || workflowSessionId }),
         });
 
-        // Enter fullscreen BEFORE changing stage — prevents speak() deferral race condition
-        // (when stage becomes 'verification', the fullscreen enforcement kicks in and speak() gets deferred
-        //  if fullscreen isn't already active. So we pre-activate it here.)
         enterFullScreen();
 
-        // MANDATORY Identity Verification for all candidates
-        speak(data.message || "Resume verified. Now, please verify your identity.", () => {
+        let toVerification = false;
+        const goVerification = () => {
+          if (toVerification) return;
+          toVerification = true;
           setStage('verification');
-        }, true);
-
-        // Safety fallback to ensure stage transition
-        setTimeout(() => setStage('verification'), 3000);
-
-      } else if (data.status === 'warning') {
-        setNameWarning(data.message);
-        speak(data.message);
+        };
+        speak(
+          "Your resume is verified. Next, please verify your identity using the camera.",
+          () => goVerification(),
+          true
+        );
+        setTimeout(goVerification, 12000);
       } else {
-        const errorMsg = data.message || "Resume verification failed.";
-        
-        if (data.code === 'OUT_OF_CREDITS' || res.status === 403) {
-          speak(errorMsg);
-          setFeedback("⚠️ " + errorMsg);
-          
-          if (data.code === 'OUT_OF_CREDITS') {
-            setTimeout(() => router.push('/pricing'), 3000);
+        const errorMsg = (data.message as string) || 'Resume verification failed.';
+        const code = data.code as string | undefined;
+
+        if (
+          code === 'OUT_OF_CREDITS' ||
+          code === 'PROFILE_NAME_MISMATCH' ||
+          code === 'RESUME_NAME_MISMATCH' ||
+          res.status === 403
+        ) {
+          speak(errorMsg, undefined, true);
+          setFeedback('⚠️ ' + errorMsg);
+
+          if (code === 'OUT_OF_CREDITS') {
+            setTimeout(() => router.push('/pricing'), 3500);
           }
           return;
         }
-        
-        setFeedback("⚠️ " + errorMsg);
-        speak(errorMsg);
+
+        setFeedback('⚠️ ' + errorMsg);
+        speak(
+          `Resume verification did not succeed. ${errorMsg} Please fix the issue and try again.`,
+          undefined,
+          true
+        );
       }
     } catch (e) {
-      setFeedback("❌ Connection error. Please ensure backend is running.");
+      await Promise.race([
+        introSpeechDone,
+        new Promise<void>((resolve) => setTimeout(resolve, 45000)),
+      ]);
+      setFeedback('❌ Connection error. Please ensure backend is running.');
       console.error(e);
+      speak(
+        'We could not reach the server to verify your resume. Check your connection and try again.',
+        undefined,
+        true
+      );
     } finally {
       setLoading(false);
     }
@@ -2015,7 +2291,34 @@ function HomeContent() {
   // --- IDENTITY VERIFICATION ---
   // Legacy polling removed in favor of robust ref-callbacks
 
+  /** Face / profile issues: user must fix profile on dashboard — no inline photo change on interview flow. */
+  const IDENTITY_DASHBOARD_CODES = ['FACE_MISMATCH', 'NO_FACE_PROFILE', 'BAD_PROFILE_IMAGE', 'NO_PROFILE_PHOTO'];
 
+  /** Server must be in FACE_VERIFIED before calibration, instructions, or interview — prevents skipping identity. */
+  const requireFaceVerifiedSession = async (): Promise<boolean> => {
+    const sid = workflowSessionId;
+    if (!sid) {
+      setFeedback('⚠️ Missing interview session. Please upload your resume again.');
+      setStage('upload');
+      return false;
+    }
+    try {
+      const r = await fetch(`${apiBase}/api/session/state?session_id=${encodeURIComponent(sid)}`);
+      const d = await r.json();
+      if (d.status === 'success' && d.current_state === 'FACE_VERIFIED') {
+        return true;
+      }
+      setVerifyStatus(
+        '❌ Identity check required: your live camera image must match your profile photo before you can continue.'
+      );
+      setStage('verification');
+      return false;
+    } catch {
+      setVerifyStatus('❌ Could not confirm identity with the server. Please use Authenticate again.');
+      setStage('verification');
+      return false;
+    }
+  };
   const captureAndVerify = async () => {
     const video = verificationVideoRef.current;
     if (!video || video.readyState < 2 || video.videoWidth === 0) {
@@ -2048,39 +2351,127 @@ function HomeContent() {
       const data = await res.json();
 
       if (data.status === 'success') {
+        setVerifyFaceCode(null);
         persistWorkflowSession(data.session_id);
         setVerifyStatus("✅ " + (data.message || "Identity & Eyes Verified Successfully!"));
         setProctorStatus({ face: true, warning: '' });
         setVerifying(false);
-        speak(data.message || "Identity verified. Now, let's calibrate your environment.", () => {
-          setStage('calibration');
-        }, true);
 
-        // Signal proctoring reset
-        fetch(`${apiBase}/proctor/reset`, { method: "POST" }).catch(() => { });
-
-        setTimeout(() => {
+        let movedToCalibration = false;
+        const goCalibration = () => {
+          if (movedToCalibration) return;
+          movedToCalibration = true;
           setStage('calibration');
-        }, 2000);
+          fetch(`${apiBase}/proctor/reset`, { method: "POST" }).catch(() => { });
+        };
+
+        speak(
+          data.message || "Identity verified. Now, let's calibrate your environment.",
+          () => goCalibration(),
+          true
+        );
+        setTimeout(goCalibration, 10000);
       } else {
-        setVerifyFailCount(prev => prev + 1);
-        setVerifyStatus("❌ " + (data.message || "Verification failed."));
+        setVerifyFailCount((prev) => prev + 1);
+        const code = typeof data.code === 'string' ? data.code : null;
+        const msgFull = String(data.message || data.detail || '');
+        const low = msgFull.toLowerCase();
+        const identityMismatchPhrase =
+          low.includes('identity not matched') ||
+          low.includes('face and eye-region') ||
+          low.includes('do not match your profile');
 
-        // Detailed feedback logic
-        if (data.message?.toLowerCase().includes("light")) {
-          speak("Verification failed due to low lighting. Please move to a brighter area.");
-        } else if (data.message?.toLowerCase().includes("eyes")) {
-          speak("Verification failed. Please keep your eyes open and look at the camera.");
-        } else {
-          speak(data.message || "Identity verification failed. Please try again.");
-        }
+        const strictPhotoMismatch =
+          'IDENTITY MISMATCH: The person on camera does not match your profile photo. You cannot continue. Open your dashboard, update your profile photo to the same person who will take this exam, save it, then start the interview again.';
+
         setVerifying(false);
+
+        if (code === 'NAME_MISMATCH') {
+          setVerifyFaceCode(null);
+          setVerifyStatus('❌ NAME MISMATCH: ' + (msgFull || 'Your account name does not match this session. Fix it on your dashboard.'));
+          speak('Name mismatch. Redirecting to your dashboard to correct your account or resume details.', undefined, true);
+          setTimeout(() => router.push('/dashboard?name_mismatch=1'), 2400);
+          return;
+        }
+
+        if (
+          (code && IDENTITY_DASHBOARD_CODES.includes(code)) ||
+          (res.status === 403 && identityMismatchPhrase)
+        ) {
+          setVerifyFaceCode(null);
+          setVerifyStatus('❌ ' + strictPhotoMismatch);
+          speak(
+            'Identity mismatch. Your profile photo must be the same person as on camera. Redirecting to your dashboard to update your photo.',
+            undefined,
+            true
+          );
+          setTimeout(() => router.push('/dashboard?identity_mismatch=1'), 2600);
+          return;
+        }
+
+        setVerifyFaceCode(code);
+        setVerifyStatus('❌ ' + (msgFull || 'Verification failed.'));
+
+        if (code === 'NO_FACE_LIVE') {
+          speak(
+            'Face not detected. Center your head in the frame, add light in front of you, then try Authenticate again.',
+            undefined,
+            true
+          );
+        } else if (low.includes('light')) {
+          speak('Verification failed due to low lighting. Please move to a brighter area.');
+        } else if (low.includes('eyes')) {
+          speak('Verification failed. Please keep your eyes open and look at the camera.');
+        } else {
+          speak(msgFull || 'Identity verification failed. Please try again.');
+        }
       }
     } catch (e) {
       setVerifyStatus("❌ Connection error. Identity verification is required to proceed.");
       setVerifying(false);
     }
   };
+
+  // Block skipping identity: server workflow must be FACE_VERIFIED before calibration or instructions.
+  useEffect(() => {
+    if (stage !== 'calibration' && stage !== 'instructions') return;
+    if (!workflowSessionId) return;
+    let cancelled = false;
+    void (async () => {
+      const ok = await requireFaceVerifiedSession();
+      if (!cancelled && !ok) {
+        /* requireFaceVerifiedSession already sent user to verification */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- gate only on stage/session change
+  }, [stage, workflowSessionId]);
+
+  /** If workflow was reset (e.g. new profile photo) while UI still shows interview/code, force re-verify. */
+  useEffect(() => {
+    if ((stage !== 'interview' && stage !== 'code') || !workflowSessionId) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const r = await fetch(`${apiBase}/api/session/state?session_id=${encodeURIComponent(workflowSessionId)}`);
+        const d = await r.json();
+        if (cancelled || d.status !== 'success') return;
+        const st = d.current_state as string;
+        if (st === 'RESUME_UPLOADED' || st === 'CREATED') {
+          setFeedback('⚠️ Your session requires identity verification again. Please match your live camera to your profile photo.');
+          setStage('verification');
+        }
+      } catch {
+        /* ignore */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [stage, workflowSessionId]);
 
 
   const handleEndInterview = async () => {
@@ -2089,6 +2480,8 @@ function HomeContent() {
 
   const confirmEndInterview = async () => {
     if (isTerminatingRef.current) return;
+
+    cancelPendingVoice();
     isTerminatingRef.current = true;
 
     setShowEndConfirm(false);
@@ -2115,7 +2508,7 @@ function HomeContent() {
         });
       }
 
-      // 2. Conclude the interview session
+      // 2. Conclude the interview session (server generates report)
       const res = await fetch(`${apiBase}/api/interview/finish`, {
         method: "POST",
         headers: { 'Content-Type': 'application/json' },
@@ -2125,30 +2518,33 @@ function HomeContent() {
 
       if (data.status === 'success') {
         setReportData(data);
+        if (data.interview_id != null) {
+          setInterviewId(String(data.interview_id));
+        }
 
-        // 3. Professional Closing
-        speak("Thank you for your time. The interview session is now concluded. Your performance report is being finalized.", () => {
-          setStage('results');
-          fetch(`${typeof window !== 'undefined' ? (process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5000') : (process.env.INTERNAL_BACKEND_URL || 'http://backend:5000')}/proctor/stop`, { method: "POST" }).catch(() => {});
-          if (document.fullscreenElement) {
-            document.exitFullscreen().catch(() => { });
-          }
-          handleDownloadReport();
-        });
+        // 3. UI first — user sees results immediately; no voice should block or duplicate this
+        setStage('results');
+        fetch(`${typeof window !== 'undefined' ? (process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5000') : (process.env.INTERNAL_BACKEND_URL || 'http://backend:5000')}/proctor/stop`, { method: "POST" }).catch(() => {});
+        if (document.fullscreenElement) {
+          document.exitFullscreen().catch(() => { });
+        }
+        handleDownloadReport();
 
-        // Fallback for stage change
-        setTimeout(() => {
-          setStage('results');
-          fetch(`${typeof window !== 'undefined' ? (process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5000') : (process.env.INTERNAL_BACKEND_URL || 'http://backend:5000')}/proctor/stop`, { method: "POST" }).catch(() => {});
-          if (document.fullscreenElement) {
-            document.exitFullscreen().catch(() => { });
-          }
-          handleDownloadReport();
-        }, 4000);
+        // 4. Optional closing line only after session is finished (does not drive navigation)
+        speak(
+          "Thank you for your time. The interview session is now concluded. Your performance report is being finalized.",
+          undefined,
+          true,
+          true
+        );
+      } else {
+        isTerminatingRef.current = false;
+        setFeedback('⚠️ ' + (data.message || 'Could not finish the interview on the server.'));
       }
     } catch (e) {
       console.error("Error ending interview:", e);
-      setStage('results'); // Fallback
+      isTerminatingRef.current = false;
+      setStage('results');
     } finally {
       setLoading(false);
     }
@@ -2876,10 +3272,23 @@ function HomeContent() {
                   {/* PiP Video Feed (Overlays Editor) */}
                   <div className="absolute top-4 right-4 w-48 aspect-video bg-black/40 rounded-xl border border-white/20 shadow-2xl overflow-hidden z-30 pointer-events-none flex items-center justify-center relative">
                     <div className="absolute bottom-3 right-3 z-40 flex flex-col items-end">
-                      <div className="flex items-center gap-1.5 px-2 py-1 bg-black/40 backdrop-blur-md rounded-lg border border-white/10">
-                        <Shield className="text-green-500 w-3 h-3" />
-                        <span className="text-[7px] font-black uppercase tracking-[0.2em] text-green-500">Secure</span>
-                      </div>
+                      {proctorStatus.face ? (
+                        proctorStatus.identityMatch === true ? (
+                          <div className="flex items-center gap-1.5 px-2 py-1 bg-black/40 backdrop-blur-md rounded-lg border border-green-500/30">
+                            <Shield className="text-green-500 w-3 h-3" />
+                            <span className="text-[7px] font-black uppercase tracking-[0.2em] text-green-500">Profile match</span>
+                          </div>
+                        ) : proctorStatus.identityMatch === false ? (
+                          <div className="flex items-center gap-1.5 px-2 py-1 bg-black/40 backdrop-blur-md rounded-lg border border-amber-500/40">
+                            <Shield className="text-amber-400 w-3 h-3" />
+                            <span className="text-[7px] font-black uppercase tracking-[0.2em] text-amber-200">No profile match</span>
+                          </div>
+                        ) : (
+                          <div className="flex items-center gap-1.5 px-2 py-1 bg-black/40 backdrop-blur-md rounded-lg border border-white/10">
+                            <span className="text-[7px] font-black uppercase tracking-[0.2em] text-slate-400">Camera</span>
+                          </div>
+                        )
+                      ) : null}
                     </div>
 
                     <video
@@ -3004,6 +3413,12 @@ function HomeContent() {
                   </div>
                 )}
 
+                {verifyFaceCode === 'NO_FACE_LIVE' && (
+                  <p className="mt-4 text-center text-xs text-slate-600 dark:text-slate-400 max-w-sm leading-relaxed px-2">
+                    No face was detected in the snapshot. Face a window or lamp (light in front of you), keep your full face in the frame, then try <strong>Authenticate</strong> again.
+                  </p>
+                )}
+
                 {/* Main Action Button */}
                 <button
                   onClick={captureAndVerify}
@@ -3102,7 +3517,9 @@ function HomeContent() {
 
               <div className="flex flex-col gap-4 max-w-md mx-auto">
                 <button
-                  onClick={() => {
+                  onClick={async () => {
+                    const ok = await requireFaceVerifiedSession();
+                    if (!ok) return;
                     speak("Calibration complete. Please review the interview instructions carefully before we begin.");
                     setStage('instructions');
                   }}
@@ -3202,7 +3619,7 @@ function HomeContent() {
                 </button>
 
                 <button
-                  onClick={() => {
+                  onClick={async () => {
                     unlockAudio();
 
                     // CRITICAL FIX: speak() is deferred when not in fullscreen (because 'instructions'
@@ -3212,6 +3629,10 @@ function HomeContent() {
                     // Step 1: Enter fullscreen immediately (required before speak() will work)
                     enterFullScreen();
 
+                    const ok = await requireFaceVerifiedSession();
+                    if (!ok) return;
+
+                    isTerminatingRef.current = false;
                     // Step 2: Set up interview state
                     hasStartedRef.current = true;
                     fetch(`${typeof window !== 'undefined' ? (process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5000') : (process.env.INTERNAL_BACKEND_URL || 'http://backend:5000')}/proctor/reset`, { method: "POST" }).catch(() => { });
@@ -3288,6 +3709,9 @@ function HomeContent() {
                       placeholder="Enter your full name"
                       className="w-full px-4 py-3 rounded-xl border-2 border-[var(--border)] bg-[var(--background)] text-[var(--foreground)] focus:border-indigo-500 outline-none transition-all font-bold"
                     />
+                    <p className="mt-2 text-xs text-[var(--text-muted)] font-medium leading-relaxed">
+                      Use the same full name as your account profile. It must match the name on your resume PDF so verification can succeed.
+                    </p>
                   </div>
 
                   <div>
@@ -3327,31 +3751,11 @@ function HomeContent() {
                       </button>
                     </div>
                   </div>
-                  {nameWarning && (
-                    <div className="p-4 bg-amber-50 dark:bg-amber-900/10 border border-amber-200 dark:border-amber-900/30 rounded-xl space-y-3 animate-fadeIn">
-                      <div className="flex items-center gap-2 text-amber-700 dark:text-amber-400 text-sm font-semibold">
-                        <AlertCircle size={18} />
-                        Potential Name Mismatch
-                      </div>
-                      <p className="text-xs text-amber-600 dark:text-amber-300">
-                        {nameWarning} If this is indeed your resume, you can proceed by clicking the button below.
-                      </p>
-                      <button
-                        type="button"
-                        disabled={loading}
-                        onClick={() => handleBeginInterview(undefined, true)}
-                        className="w-full py-2 bg-amber-600 hover:bg-amber-700 text-white text-xs font-bold rounded-lg transition-colors flex items-center justify-center gap-2"
-                      >
-                        {loading ? <Loader size={14} className="animate-spin" /> : <Shield size={14} />}
-                        Confirm & Begin Interview Anyway
-                      </button>
-                    </div>
-                  )}
 
                   <button
                     onClick={handleBeginInterview}
                     disabled={loading}
-                    className={`w-full py-5 ${nameWarning ? 'bg-slate-200 text-slate-500 cursor-not-allowed opacity-50' : 'bg-indigo-600 text-white hover:bg-indigo-700 shadow-xl hover:shadow-indigo-500/30'} rounded-2xl font-black text-xl transition-all`}
+                    className="w-full py-5 bg-indigo-600 text-white hover:bg-indigo-700 shadow-xl hover:shadow-indigo-500/30 rounded-2xl font-black text-xl transition-all disabled:opacity-60 disabled:cursor-not-allowed"
                   >
                     {loading ? "Analyzing Resume..." : "Begin Interview"}
                   </button>
@@ -3446,43 +3850,6 @@ function HomeContent() {
                       </div>
                     </div>
 
-                    {/* SILENCE COUNTDOWN OVERLAY */}
-                    {isSilenced && silenceCountdown !== null && (
-                      <div className="absolute top-0 right-0 bottom-0 left-0 z-[100] flex flex-col items-end justify-end p-10 pointer-events-none animate-in fade-in duration-500">
-                        {/* Background dimming layer - keeping it subtler for 'aside' view */}
-                        <div className="absolute inset-0 bg-slate-950/20 backdrop-blur-[1px] pointer-events-none"></div>
-
-                        <div className="relative z-[101] pointer-events-auto flex flex-col items-end">
-                          <div className={`text-6xl font-black italic mb-4 drop-shadow-2xl transition-colors duration-300 ${silenceCountdown <= 5 ? 'text-red-500 scale-110' : 'text-white'}`}>
-                            {silenceCountdown}
-                            <span className="text-xl ml-2 uppercase tracking-widest not-italic">sec</span>
-                          </div>
-
-                          <div className="flex gap-4">
-                            <button
-                              onClick={() => {
-                                setSilenceCountdown(30);
-                                lastSpeechTimeRef.current = Date.now();
-                                if (!isListening) safeStartRecognition();
-                              }}
-                              className="px-6 py-3 bg-white/10 hover:bg-white text-white hover:text-slate-900 border-2 border-white/20 rounded-xl font-black uppercase text-xs tracking-widest transition-all active:scale-95 group"
-                            >
-                              Extend 30s
-                            </button>
-                            <button
-                              onClick={handleSubmitAnswer}
-                              className="px-6 py-3 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl font-black uppercase text-xs tracking-widest shadow-2xl shadow-indigo-600/30 transition-all active:scale-95"
-                            >
-                              Next Question
-                            </button>
-                          </div>
-
-                          <div className="mt-6 px-4 py-1 bg-white/5 rounded-full border border-white/10 text-[9px] font-black uppercase tracking-[0.3em] text-white/60 animate-pulse">
-                            Silence Detected — Recording Paused
-                          </div>
-                        </div>
-                      </div>
-                    )}
                   </div>
                 </div>
 
@@ -3516,10 +3883,23 @@ function HomeContent() {
                     </div>
 
                     <div className="absolute bottom-3 right-3 z-40 flex flex-col items-end">
-                      <div className="flex items-center gap-1.5 px-2 py-1 bg-black/40 backdrop-blur-md rounded-lg border border-white/10">
-                        <Shield className="text-green-500 w-3 h-3" />
-                        <span className="text-[7px] font-black uppercase tracking-[0.2em] text-green-500">Secure</span>
-                      </div>
+                      {proctorStatus.face ? (
+                        proctorStatus.identityMatch === true ? (
+                          <div className="flex items-center gap-1.5 px-2 py-1 bg-black/40 backdrop-blur-md rounded-lg border border-green-500/30">
+                            <Shield className="text-green-500 w-3 h-3" />
+                            <span className="text-[7px] font-black uppercase tracking-[0.2em] text-green-500">Profile match</span>
+                          </div>
+                        ) : proctorStatus.identityMatch === false ? (
+                          <div className="flex items-center gap-1.5 px-2 py-1 bg-black/40 backdrop-blur-md rounded-lg border border-amber-500/40">
+                            <Shield className="text-amber-400 w-3 h-3" />
+                            <span className="text-[7px] font-black uppercase tracking-[0.2em] text-amber-200">No profile match</span>
+                          </div>
+                        ) : (
+                          <div className="flex items-center gap-1.5 px-2 py-1 bg-black/40 backdrop-blur-md rounded-lg border border-white/10">
+                            <span className="text-[7px] font-black uppercase tracking-[0.2em] text-slate-400">Camera</span>
+                          </div>
+                        )
+                      ) : null}
                     </div>
 
                     <video
@@ -3663,8 +4043,8 @@ function HomeContent() {
 
                   <div className="bg-indigo-50 py-3 mx-4 mb-2 rounded-xl text-center">
                     <span className="text-[9px] font-black text-indigo-600 uppercase tracking-widest flex items-center justify-center gap-2">
-                      <div className={`w-1.5 h-1.5 bg-indigo-500 rounded-full transition-all duration-75 ${audioLevel > 5 ? 'scale-[2.5] bg-indigo-400 shadow-[0_0_10px_rgba(99,102,241,0.8)]' : 'animate-pulse'}`}></div>
-                      {audioLevel > 5 ? "Capturing your voice..." : "Interviewer is listening"}
+                      <div className={`w-1.5 h-1.5 bg-indigo-500 rounded-full transition-all duration-75 ${audioLevel > 2 ? 'scale-[2.5] bg-indigo-400 shadow-[0_0_10px_rgba(99,102,241,0.8)]' : 'animate-pulse'}`}></div>
+                      {audioLevel > 2 ? "Capturing your voice..." : "Interviewer is listening"}
                     </span>
                   </div>
 
@@ -3674,12 +4054,12 @@ function HomeContent() {
                       {new Array(30).fill(0).map((_, i) => (
                         <div
                           key={i}
-                          className={`h-full flex-1 transition-all duration-100 ${audioLevel > (i * 3) ? 'bg-indigo-500' : 'bg-slate-200 opacity-30'}`}
+                          className={`h-full flex-1 transition-all duration-100 ${audioLevel > (i * 1.5) ? 'bg-indigo-500' : 'bg-slate-200 opacity-30'}`}
                         />
                       ))}
                     </div>
                     <div className="flex justify-between mt-1 px-1">
-                      <span className="text-[7px] font-black text-slate-300 uppercase tracking-tighter">Silence</span>
+                      <span className="text-[7px] font-black text-slate-300 uppercase tracking-tighter">Quiet</span>
                       <span className="text-[7px] font-black text-indigo-400 uppercase tracking-tighter">Voice Peak</span>
                     </div>
                   </div>
@@ -3702,9 +4082,9 @@ function HomeContent() {
                       <div className="w-1 h-1 bg-blue-600 rounded-full animate-bounce delay-100"></div>
                       <div className="w-1 h-1 bg-blue-600 rounded-full animate-bounce delay-200"></div>
                     </div>
-                    <span className="text-[10px] font-black text-blue-700 uppercase tracking-widest">Auto-Submit Active (10s Silence)</span>
+                    <span className="text-[10px] font-black text-blue-700 uppercase tracking-widest">Submit when ready</span>
                   </div>
-                  <p className="text-[9px] text-blue-500 font-bold leading-relaxed ml-7">Answer will be submitted automatically after you stop speaking.</p>
+                  <p className="text-[9px] text-blue-500 font-bold leading-relaxed ml-7">Press Submit and Proceed or Enter when you have finished your answer. Server transcription uses your recording for accuracy.</p>
                 </div>
 
                 {/* Actions Section */}
@@ -3851,7 +4231,7 @@ function HomeContent() {
 
       {/* GLOBAL SECURITY OVERLAYS */}
       {
-        showFullscreenWarn && (
+        showFullscreenWarn && !['results', 'report'].includes(stage) && (
           <div className="fixed inset-0 z-[300] bg-white/90 backdrop-blur-xl flex items-center justify-center p-8">
             <div className="bg-white dark:bg-gray-900 p-8 rounded-[3rem] max-w-lg text-center shadow-[0_0_50px_rgba(239,68,68,0.3)] border border-red-500/50 animate-in zoom-in duration-300">
               <div className="w-20 h-20 bg-red-100 text-red-600 rounded-full flex items-center justify-center mx-auto mb-6">
@@ -3879,7 +4259,7 @@ function HomeContent() {
       }
 
       {
-        showTabSwitchWarn && (
+        showTabSwitchWarn && !['results', 'report'].includes(stage) && (
           <div className="fixed inset-0 z-[301] bg-white/90 backdrop-blur-xl flex items-center justify-center p-8">
             <div className="bg-white dark:bg-gray-900 p-8 rounded-[3rem] max-w-lg text-center shadow-[0_0_50px_rgba(245,158,11,0.3)] border border-orange-500/50 animate-in zoom-in duration-300">
               <div className="w-20 h-20 bg-orange-100 text-orange-600 rounded-full flex items-center justify-center mx-auto mb-6">

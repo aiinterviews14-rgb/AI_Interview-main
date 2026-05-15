@@ -1,5 +1,6 @@
 import sqlite3
 import datetime
+import hashlib
 import json
 import os
 import time
@@ -22,7 +23,7 @@ def get_db_connection():
     Strictly uses PGAdmin/PostgreSQL as requested. (No SQLite fallback).
     """
     if not psycopg2:
-        raise ImportError("❌ 'psycopg2' is missing. Try: pip install psycopg2-binary")
+        raise ImportError("X 'psycopg2' is missing. Try: pip install psycopg2-binary")
 
     # Load from Environment
     db_host = os.environ.get('DB_HOST', 'localhost')
@@ -43,7 +44,7 @@ def get_db_connection():
         )
         return conn, 'postgres'
     except Exception as e:
-        print(f"⚠️ PostgreSQL Var Connection Failed: {e}")
+        print(f"(!) PostgreSQL Var Connection Failed: {e}")
         
         # 2. Fallback: Use DATABASE_URL
         db_url = os.environ.get('DATABASE_URL')
@@ -52,9 +53,9 @@ def get_db_connection():
                 conn = psycopg2.connect(db_url, connect_timeout=5)
                 return conn, 'postgres'
             except Exception as e2:
-                 raise ConnectionError(f"❌ PostgreSQL Connection Error. Check PGAdmin and your .env file.\nVar Error: {e}\nURL Error: {e2}")
+                 raise ConnectionError(f"X PostgreSQL Connection Error. Check PGAdmin and your .env file.\nVar Error: {e}\nURL Error: {e2}")
         
-        raise ConnectionError(f"❌ PostgreSQL Connection Failed ({db_host}:{db_port}). Ensure PGAdmin is running and the database '{db_name}' exists. Error: {e}")
+        raise ConnectionError(f"X PostgreSQL Connection Failed ({db_host}:{db_port}). Ensure PGAdmin is running and the database '{db_name}' exists. Error: {e}")
 
 
 def init_db(app):
@@ -63,8 +64,8 @@ def init_db(app):
     bcrypt.init_app(app)
 
     # Retry DB connection (helps ECS/RDS on cold start or slow networking)
-    max_retries = int(os.environ.get("DB_INIT_RETRIES", "12"))
-    delay = float(os.environ.get("DB_INIT_RETRY_DELAY", "2"))
+    max_retries = int(os.environ.get("DB_INIT_RETRIES", "5"))
+    delay = float(os.environ.get("DB_INIT_RETRY_DELAY", "1"))
     conn, db_type = None, None
     for attempt in range(1, max_retries + 1):
         try:
@@ -196,8 +197,8 @@ def create_user(name, email, phone, password, photo=None, college_name=None, rol
     conn, db_type = get_db_connection()
     c = conn.cursor()
     try:
-        # Normalize email to lowercase
-        email_normalized = email.lower() if email else None
+        # Normalize email to lowercase and trim whitespace
+        email_normalized = email.strip().lower() if email else None
         hashed_pw = bcrypt.generate_password_hash(password).decode('utf-8')
         
         query = "INSERT INTO users (name, email, phone, password, photo, college_name, role, year, register_no, branch, domain, resume_score, plan_id, interviews_remaining) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
@@ -303,6 +304,26 @@ def update_workflow_session(session_id, *, state=None, context=None):
     finally:
         conn.close()
 
+
+def _upgrade_stored_password_to_bcrypt(user_id, plain_password):
+    """Replace legacy SHA-256 hex with bcrypt after a successful login."""
+    if not user_id or not plain_password:
+        return
+    conn, db_type = get_db_connection()
+    c = conn.cursor()
+    try:
+        hashed_pw = bcrypt.generate_password_hash(plain_password).decode("utf-8")
+        q = "UPDATE users SET password=? WHERE id=?"
+        if db_type == "postgres":
+            q = q.replace("?", "%s")
+        c.execute(q, (hashed_pw, int(user_id)))
+        conn.commit()
+    except Exception as e:
+        print(f"[AUTH] bcrypt upgrade skipped: {e}")
+    finally:
+        conn.close()
+
+
 def authenticate_user(identifier, password):
     conn, db_type = get_db_connection()
     # Use dict cursor for consistent access if postgres, sqlite uses Row which is dict-like
@@ -310,10 +331,20 @@ def authenticate_user(identifier, password):
         c = conn.cursor(cursor_factory=RealDictCursor)
     else:
         c = conn.cursor()
-        
-    # Normalize identifier if it looks like an email
-    normalized_id = identifier.lower() if '@' in identifier else identifier
-    
+
+    if not identifier or not isinstance(identifier, str):
+        conn.close()
+        return None
+    if password is None or (isinstance(password, str) and password == ""):
+        conn.close()
+        return None
+    if not isinstance(password, str):
+        conn.close()
+        return None
+
+    # Normalize identifier (strip whitespace, lowercase if email)
+    normalized_id = identifier.strip().lower() if '@' in identifier else identifier.strip()
+
     query = "SELECT id, name, email, phone, password, resume_path, resume_score, photo, college_name, role, year, branch, domain, plan_id, interviews_remaining FROM users WHERE email=? OR phone=?"
     if db_type == 'postgres':
         query = query.replace('?', '%s')
@@ -321,29 +352,52 @@ def authenticate_user(identifier, password):
     c.execute(query, (normalized_id, normalized_id))
     row = c.fetchone()
     conn.close()
-    
-    if row:
-        # Convert to a standard dictionary to support .get() and .keys() everywhere
-        user = dict(row)
-        
-        # Check password
-        stored_pw = user.get('password')
-        if stored_pw and bcrypt.check_password_hash(stored_pw, password):
-             return {
-                 "id": user.get('id'),
-                 "name": user.get('name'),
-                 "email": user.get('email'),
-                 "phone": user.get('phone'),
-                 "resume_path": user.get('resume_path'),
-                 "photo": user.get('photo'),
-                 "college_name": user.get('college_name'),
-                 "role": user.get('role', 'candidate'),
-                 "year": user.get('year', 'N/A'),
-                 "branch": user.get('branch'),
-                 "domain": user.get('domain'),
-                 "resume_score": user.get('resume_score'),
-                 "plan_id": user.get('plan_id', 'free'), 'interviews_remaining': user.get('interviews_remaining', 0)
-             }
+
+    if not row:
+        return None
+
+    user = dict(row)
+    stored_pw = user.get('password')
+    if not stored_pw or not isinstance(stored_pw, str):
+        print("[AUTH] No password hash on file for this account.")
+        return None
+
+    is_valid = False
+    try:
+        if stored_pw.startswith("$2"):
+            is_valid = bcrypt.check_password_hash(stored_pw, password)
+        else:
+            # Legacy plain SHA-256 hex (64 chars) — verify then caller can migrate to bcrypt on next password change
+            sp = stored_pw.strip().lower()
+            if len(sp) == 64 and all(c in "0123456789abcdef" for c in sp):
+                digest = hashlib.sha256(password.encode("utf-8")).hexdigest().lower()
+                is_valid = digest == sp
+            else:
+                print("[AUTH] Unsupported password hash format.")
+                is_valid = False
+    except (ValueError, TypeError) as e:
+        print(f"[AUTH] Password verification error: {e}")
+        return None
+
+    if is_valid:
+        if isinstance(stored_pw, str) and not stored_pw.startswith("$2"):
+            _upgrade_stored_password_to_bcrypt(user.get("id"), password)
+        return {
+            "id": user.get("id"),
+            "name": user.get("name"),
+            "email": user.get("email"),
+            "phone": user.get("phone"),
+            "resume_path": user.get("resume_path"),
+            "photo": user.get("photo"),
+            "college_name": user.get("college_name"),
+            "role": user.get("role", "candidate"),
+            "year": user.get("year", "N/A"),
+            "branch": user.get("branch"),
+            "domain": user.get("domain"),
+            "resume_score": user.get("resume_score"),
+            "plan_id": user.get("plan_id", "free"),
+            "interviews_remaining": user.get("interviews_remaining", 0),
+        }
     return None
 
 def create_order_log(user_id, order_id, amount):
@@ -475,6 +529,7 @@ def update_user_plan(user_id, plan_id):
         conn.close()
 
 def update_user_profile(user_id, name, email, phone, college_name, year, photo=None, resume_path=None, register_no=None, branch=None, domain=None):
+    """Update user fields. When ``photo`` is provided, it replaces the entire prior ``users.photo`` value (no separate file row)."""
     conn, db_type = get_db_connection()
     c = conn.cursor()
     try:
@@ -557,11 +612,50 @@ def get_user_photo(user_id):
     query = "SELECT photo FROM users WHERE id=?"
     if db_type == 'postgres':
         query = query.replace('?', '%s')
-    c.execute(query, (user_id,))
+    try:
+        uid = int(user_id)
+    except (TypeError, ValueError):
+        uid = user_id
+    c.execute(query, (uid,))
     row = c.fetchone()
     conn.close()
-    if row: return row[0]
-    return None
+    if not row or row[0] is None:
+        return None
+    photo = row[0]
+    if isinstance(photo, memoryview):
+        photo = photo.tobytes()
+    if isinstance(photo, (bytes, bytearray)):
+        try:
+            photo = photo.decode("utf-8")
+        except UnicodeDecodeError:
+            import base64
+
+            photo = base64.b64encode(bytes(photo)).decode("ascii")
+    return photo
+
+
+def update_user_photo(user_id, photo):
+    """Replace the profile photo column; previous image data is superseded by this UPDATE."""
+    conn, db_type = get_db_connection()
+    c = conn.cursor()
+    try:
+        uid = int(user_id)
+    except (TypeError, ValueError):
+        conn.close()
+        return False
+    try:
+        q = "UPDATE users SET photo=? WHERE id=?"
+        if db_type == "postgres":
+            q = q.replace("?", "%s")
+        c.execute(q, (photo, uid))
+        conn.commit()
+        return c.rowcount > 0
+    except Exception as e:
+        print(f"update_user_photo error: {e}")
+        return False
+    finally:
+        conn.close()
+
 
 def update_resume_path(user_id, path):
     conn, db_type = get_db_connection()

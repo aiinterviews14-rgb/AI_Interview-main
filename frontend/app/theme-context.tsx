@@ -17,13 +17,18 @@ const ThemeContext = createContext<ThemeContextType>({
 });
 
 export const ThemeProvider = ({ children }: { children: React.ReactNode }) => {
-    const [theme, setThemeState] = useState<Theme>(() => {
-        if (typeof window === 'undefined') return 'light';
-        const stored = localStorage.getItem('app_theme') as Theme | null;
-        if (stored === 'dark' || stored === 'light') return stored;
-        if (window.matchMedia('(prefers-color-scheme: dark)').matches) return 'dark';
-        return 'light';
-    });
+    const [theme, setThemeState] = useState<Theme>('light');
+
+    useEffect(() => {
+        if (typeof window !== 'undefined') {
+            const stored = localStorage.getItem('app_theme') as Theme | null;
+            if (stored === 'dark' || stored === 'light') {
+                setThemeState(stored);
+            } else if (window.matchMedia('(prefers-color-scheme: dark)').matches) {
+                setThemeState('dark');
+            }
+        }
+    }, []);
 
     const applyTheme = (t: Theme) => {
         const root = document.documentElement; // <html>

@@ -13,6 +13,8 @@ def test_workflow_valid_transitions():
     assert can_transition(STATE_CREATED, STATE_RESUME_UPLOADED)
     assert can_transition(STATE_RESUME_UPLOADED, STATE_FACE_VERIFIED)
     assert can_transition(STATE_FACE_VERIFIED, STATE_INTERVIEW_IN_PROGRESS)
+    assert can_transition(STATE_FACE_VERIFIED, STATE_RESUME_UPLOADED)
+    assert can_transition(STATE_INTERVIEW_IN_PROGRESS, STATE_RESUME_UPLOADED)
     assert can_transition(STATE_INTERVIEW_IN_PROGRESS, STATE_INTERVIEW_FINISHED)
 
 
